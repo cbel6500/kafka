@@ -23,8 +23,8 @@ import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.processor.internals.MockStreamsMetrics;
-import static org.hamcrest.MatcherAssert.assertThat;
-import org.junit.Test;
+
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -33,13 +33,14 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.function.Supplier;
 
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.Is.is;
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ThreadCacheTest {
     final String namespace = "0.0-namespace";
@@ -106,8 +107,8 @@ public class ThreadCacheTest {
         final long usedRuntimeMemory = runtime.totalMemory() - runtime.freeMemory() - prevRuntimeMemory;
         assertTrue((double) cache.sizeBytes() <= ceiling);
 
-        assertTrue("Used memory size " + usedRuntimeMemory + " greater than expected " + cache.sizeBytes() * systemFactor,
-            cache.sizeBytes() * systemFactor >= usedRuntimeMemory);
+        assertTrue(cache.sizeBytes() * systemFactor >= usedRuntimeMemory,
+                "Used memory size " + usedRuntimeMemory + " greater than expected " + cache.sizeBytes() * systemFactor);
     }
 
     @Test
@@ -192,7 +193,7 @@ public class ThreadCacheTest {
         final Bytes key = Bytes.wrap(new byte[]{0});
 
         cache.put(namespace, key, dirtyEntry(key.get()));
-        assertEquals(key.get(), cache.delete(namespace, key).value());
+        assertArrayEquals(key.get(), cache.delete(namespace, key).value());
         assertNull(cache.get(namespace, key));
     }
 
@@ -203,7 +204,7 @@ public class ThreadCacheTest {
         final List<ThreadCache.DirtyEntry> received = new ArrayList<>();
         cache.addDirtyEntryFlushListener(namespace, received::addAll);
         cache.put(namespace, key, dirtyEntry(key.get()));
-        assertEquals(key.get(), cache.delete(namespace, key).value());
+        assertArrayEquals(key.get(), cache.delete(namespace, key).value());
 
         // flushing should have no further effect
         cache.flush(namespace);

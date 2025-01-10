@@ -49,22 +49,24 @@ import static org.apache.kafka.server.authorizer.AuthorizationResult.DENIED;
  * configured.
  */
 public class StandardAuthorizer implements ClusterMetadataAuthorizer {
-    public final static String SUPER_USERS_CONFIG = "super.users";
+    public static final String SUPER_USERS_CONFIG = "super.users";
 
-    public final static String ALLOW_EVERYONE_IF_NO_ACL_IS_FOUND_CONFIG = "allow.everyone.if.no.acl.found";
+    public static final String ALLOW_EVERYONE_IF_NO_ACL_IS_FOUND_CONFIG = "allow.everyone.if.no.acl.found";
 
     /**
-     * A future which is completed once we have loaded up to the initial high water mark.
+     * A future which is completed once we have loaded up to the initial high watermark.
      */
     private final CompletableFuture<Void> initialLoadFuture = new CompletableFuture<>();
 
     /**
-     * The current data. Can be read without a lock. Must be written while holding the object lock.
+     * The current data. We use a read-write lock to synchronize reads and writes to the data. We
+     * expect one writer and multiple readers accessing the ACL data, and we use the lock to make
+     * sure we have consistent reads when writer tries to change the data.
      */
     private volatile StandardAuthorizerData data = StandardAuthorizerData.createEmpty();
 
     @Override
-    public synchronized void setAclMutator(AclMutator aclMutator) {
+    public void setAclMutator(AclMutator aclMutator) {
         this.data = data.copyWithNewAclMutator(aclMutator);
     }
 
@@ -78,7 +80,7 @@ public class StandardAuthorizer implements ClusterMetadataAuthorizer {
     }
 
     @Override
-    public synchronized void completeInitialLoad() {
+    public void completeInitialLoad() {
         data = data.copyWithNewLoadingComplete(true);
         data.log.info("Completed initial ACL load process.");
         initialLoadFuture.complete(null);
@@ -91,8 +93,10 @@ public class StandardAuthorizer implements ClusterMetadataAuthorizer {
 
     @Override
     public void completeInitialLoad(Exception e) {
-        data.log.error("Failed to complete initial ACL load process.", e);
-        initialLoadFuture.completeExceptionally(e);
+        if (!initialLoadFuture.isDone()) {
+            data.log.error("Failed to complete initial ACL load process.", e);
+            initialLoadFuture.completeExceptionally(e);
+        }
     }
 
     @Override
@@ -106,8 +110,12 @@ public class StandardAuthorizer implements ClusterMetadataAuthorizer {
     }
 
     @Override
-    public synchronized void loadSnapshot(Map<Uuid, StandardAcl> acls) {
-        data = data.copyWithNewAcls(acls.entrySet());
+    public void loadSnapshot(Map<Uuid, StandardAcl> acls) {
+        StandardAuthorizerData newData = StandardAuthorizerData.createEmpty();
+        for (Map.Entry<Uuid, StandardAcl> entry : acls.entrySet()) {
+            newData.addAcl(entry.getKey(), entry.getValue());
+        }
+        data = data.copyWithNewAcls(newData.getAclCache());
     }
 
     @Override
@@ -116,7 +124,7 @@ public class StandardAuthorizer implements ClusterMetadataAuthorizer {
         Map<Endpoint, CompletableFuture<Void>> result = new HashMap<>();
         for (Endpoint endpoint : serverInfo.endpoints()) {
             if (serverInfo.earlyStartListeners().contains(
-                    endpoint.listenerName().orElseGet(() -> ""))) {
+                    endpoint.listenerName().orElse(""))) {
                 result.put(endpoint, CompletableFuture.completedFuture(null));
             } else {
                 result.put(endpoint, initialLoadFuture);
@@ -129,9 +137,9 @@ public class StandardAuthorizer implements ClusterMetadataAuthorizer {
     public List<AuthorizationResult> authorize(
             AuthorizableRequestContext requestContext,
             List<Action> actions) {
-        StandardAuthorizerData curData = data;
         List<AuthorizationResult> results = new ArrayList<>(actions.size());
-        for (Action action: actions) {
+        StandardAuthorizerData curData = data;
+        for (Action action : actions) {
             AuthorizationResult result = curData.authorize(requestContext, action);
             results.add(result);
         }
@@ -140,6 +148,8 @@ public class StandardAuthorizer implements ClusterMetadataAuthorizer {
 
     @Override
     public Iterable<AclBinding> acls(AclBindingFilter filter) {
+        // The Iterable returned here is consistent because it is created over a read-only
+        // copy of ACLs data.
         return data.acls(filter);
     }
 
@@ -156,16 +166,16 @@ public class StandardAuthorizer implements ClusterMetadataAuthorizer {
     }
 
     @Override
-    public synchronized void configure(Map<String, ?> configs) {
+    public void configure(Map<String, ?> configs) {
         Set<String> superUsers = getConfiguredSuperUsers(configs);
         AuthorizationResult defaultResult = getDefaultResult(configs);
         int nodeId;
         try {
-            nodeId = Integer.parseInt(configs.get("node.id").toString());
+            nodeId = Integer.parseInt(configs.get("node.id").toString().trim());
         } catch (Exception e) {
             nodeId = -1;
         }
-        this.data = data.copyWithNewConfig(nodeId, superUsers, defaultResult);
+        data = data.copyWithNewConfig(nodeId, superUsers, defaultResult);
         this.data.log.info("set super.users={}, default result={}", String.join(",", superUsers), defaultResult);
     }
 
@@ -196,6 +206,6 @@ public class StandardAuthorizer implements ClusterMetadataAuthorizer {
     static AuthorizationResult getDefaultResult(Map<String, ?> configs) {
         Object configValue = configs.get(ALLOW_EVERYONE_IF_NO_ACL_IS_FOUND_CONFIG);
         if (configValue == null) return DENIED;
-        return Boolean.valueOf(configValue.toString()) ? ALLOWED : DENIED;
+        return Boolean.parseBoolean(configValue.toString().trim()) ? ALLOWED : DENIED;
     }
 }

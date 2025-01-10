@@ -21,15 +21,15 @@ then
 fi
 base_dir=$(dirname $0)
 
-if [ "x$KAFKA_LOG4J_OPTS" = "x" ]; then
-  LOG4J_CONFIG_NORMAL_INSTALL="/etc/kafka/log4j.properties"
-  LOG4J_CONFIG_ZIP_INSTALL="$base_dir/../etc/kafka/log4j.properties"
+if [ -z "$KAFKA_LOG4J_OPTS" ]; then
+  LOG4J_CONFIG_NORMAL_INSTALL="/etc/kafka/log4j2.yaml"
+  LOG4J_CONFIG_ZIP_INSTALL="$base_dir/../etc/kafka/log4j2.yaml"
   if [ -e "$LOG4J_CONFIG_NORMAL_INSTALL" ]; then # Normal install layout
-    KAFKA_LOG4J_OPTS="-Dlog4j.configuration=file:${LOG4J_CONFIG_NORMAL_INSTALL}"
+    KAFKA_LOG4J_OPTS="-Dlog4j2.configurationFile=${LOG4J_CONFIG_NORMAL_INSTALL}"
   elif [ -e "${LOG4J_CONFIG_ZIP_INSTALL}" ]; then # Simple zip file layout
-    KAFKA_LOG4J_OPTS="-Dlog4j.configuration=file:${LOG4J_CONFIG_ZIP_INSTALL}"
+    KAFKA_LOG4J_OPTS="-Dlog4j2.configurationFile=${LOG4J_CONFIG_ZIP_INSTALL}"
   else # Fallback to normal default
-    KAFKA_LOG4J_OPTS="-Dlog4j.configuration=file:$base_dir/../config/log4j.properties"
+    KAFKA_LOG4J_OPTS="-Dlog4j2.configurationFile=$base_dir/../config/log4j2.yaml"
   fi
 fi
 export KAFKA_LOG4J_OPTS

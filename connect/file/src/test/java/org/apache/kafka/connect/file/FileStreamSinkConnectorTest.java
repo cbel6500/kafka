@@ -19,16 +19,17 @@ package org.apache.kafka.connect.file;
 import org.apache.kafka.common.config.ConfigValue;
 import org.apache.kafka.connect.connector.ConnectorContext;
 import org.apache.kafka.connect.sink.SinkConnector;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.mockito.Mockito.mock;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.mockito.Mockito.mock;
 
 public class FileStreamSinkConnectorTest {
 
@@ -36,13 +37,12 @@ public class FileStreamSinkConnectorTest {
     private static final String FILENAME = "/afilename";
 
     private FileStreamSinkConnector connector;
-    private ConnectorContext ctx;
     private Map<String, String> sinkProperties;
 
     @BeforeEach
     public void setup() {
         connector = new FileStreamSinkConnector();
-        ctx = mock(ConnectorContext.class);
+        ConnectorContext ctx = mock(ConnectorContext.class);
         connector.initialize(ctx);
 
         sinkProperties = new HashMap<>();
@@ -74,16 +74,27 @@ public class FileStreamSinkConnectorTest {
 
     @Test
     public void testSinkTasksStdout() {
-        sinkProperties.remove(FileStreamSourceConnector.FILE_CONFIG);
+        sinkProperties.remove(FileStreamSinkConnector.FILE_CONFIG);
         connector.start(sinkProperties);
         List<Map<String, String>> taskConfigs = connector.taskConfigs(1);
         assertEquals(1, taskConfigs.size());
-        assertNull(taskConfigs.get(0).get(FileStreamSourceConnector.FILE_CONFIG));
+        assertNull(taskConfigs.get(0).get(FileStreamSinkConnector.FILE_CONFIG));
     }
 
     @Test
     public void testTaskClass() {
         connector.start(sinkProperties);
         assertEquals(FileStreamSinkTask.class, connector.taskClass());
+    }
+
+    @Test
+    public void testConnectorConfigsPropagateToTaskConfigs() {
+        // This is required so that updates in transforms/converters/clients configs get reflected
+        // in tasks without manual restarts of the tasks (see https://issues.apache.org/jira/browse/KAFKA-13809)
+        sinkProperties.put("transforms", "insert");
+        connector.start(sinkProperties);
+        List<Map<String, String>> taskConfigs = connector.taskConfigs(1);
+        assertEquals(1, taskConfigs.size());
+        assertEquals("insert", taskConfigs.get(0).get("transforms"));
     }
 }

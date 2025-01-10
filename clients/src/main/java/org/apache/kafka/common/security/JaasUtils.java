@@ -17,6 +17,7 @@
 package org.apache.kafka.common.security;
 
 import org.apache.kafka.common.KafkaException;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,7 +26,8 @@ import javax.security.auth.login.Configuration;
 public final class JaasUtils {
     private static final Logger LOG = LoggerFactory.getLogger(JaasUtils.class);
     public static final String JAVA_LOGIN_CONFIG_PARAM = "java.security.auth.login.config";
-
+    public static final String DISALLOWED_LOGIN_MODULES_CONFIG = "org.apache.kafka.disallowed.login.modules";
+    public static final String DISALLOWED_LOGIN_MODULES_DEFAULT = "com.sun.security.auth.module.JndiLoginModule";
     public static final String SERVICE_NAME = "serviceName";
 
     public static final String ZK_SASL_CLIENT = "zookeeper.sasl.client";
@@ -78,4 +80,3 @@ public final class JaasUtils {
         return foundLoginConfigEntry;
     }
 }
-

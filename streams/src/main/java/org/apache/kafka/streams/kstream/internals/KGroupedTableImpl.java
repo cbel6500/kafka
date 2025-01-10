@@ -25,12 +25,13 @@ import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Named;
 import org.apache.kafka.streams.kstream.Reducer;
+import org.apache.kafka.streams.kstream.internals.graph.GraphNode;
 import org.apache.kafka.streams.kstream.internals.graph.GroupedTableOperationRepartitionNode;
 import org.apache.kafka.streams.kstream.internals.graph.ProcessorParameters;
 import org.apache.kafka.streams.kstream.internals.graph.StatefulProcessorNode;
-import org.apache.kafka.streams.kstream.internals.graph.GraphNode;
 import org.apache.kafka.streams.processor.api.ProcessorSupplier;
 import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.VersionedBytesStoreSupplier;
 
 import java.util.Collections;
 import java.util.Objects;
@@ -90,8 +91,9 @@ public class KGroupedTableImpl<K, V> extends AbstractStream<K, V> implements KGr
         final StatefulProcessorNode statefulProcessorNode = new StatefulProcessorNode<>(
             funcName,
             new ProcessorParameters<>(aggregateSupplier, funcName),
-            new TimestampedKeyValueStoreMaterializer<>(materialized).materialize()
+            new String[]{materialized.storeName()}
         );
+        statefulProcessorNode.setOutputVersioned(materialized.storeSupplier() instanceof VersionedBytesStoreSupplier);
 
         // now the repartition node must be the parent of the StateProcessorNode
         builder.addGraphNode(repartitionGraphNode, statefulProcessorNode);
@@ -146,7 +148,7 @@ public class KGroupedTableImpl<K, V> extends AbstractStream<K, V> implements KGr
             materializedInternal.withValueSerde(valueSerde);
         }
         final ProcessorSupplier<K, Change<V>, K, Change<V>> aggregateSupplier = new KTableReduce<>(
-            materializedInternal.storeName(),
+            materializedInternal,
             adder,
             subtractor);
         return doAggregate(aggregateSupplier, new NamedInternal(named), REDUCE_NAME, materializedInternal);
@@ -177,7 +179,7 @@ public class KGroupedTableImpl<K, V> extends AbstractStream<K, V> implements KGr
         }
 
         final ProcessorSupplier<K, Change<V>, K, Change<Long>> aggregateSupplier = new KTableAggregate<>(
-            materializedInternal.storeName(),
+            materializedInternal,
             countInitializer,
             countAdder,
             countSubtractor);
@@ -222,7 +224,7 @@ public class KGroupedTableImpl<K, V> extends AbstractStream<K, V> implements KGr
             materializedInternal.withKeySerde(keySerde);
         }
         final ProcessorSupplier<K, Change<V>, K, Change<VAgg>> aggregateSupplier = new KTableAggregate<>(
-            materializedInternal.storeName(),
+            materializedInternal,
             initializer,
             adder,
             subtractor);

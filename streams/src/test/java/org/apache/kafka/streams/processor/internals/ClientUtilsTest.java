@@ -16,10 +16,6 @@
  */
 package org.apache.kafka.streams.processor.internals;
 
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.concurrent.ExecutionException;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.ListOffsetsResult;
@@ -36,25 +32,34 @@ import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.streams.errors.StreamsException;
-import org.easymock.EasyMock;
-import org.junit.Test;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
 
 import static java.util.Arrays.asList;
 import static java.util.Collections.emptySet;
-import static org.apache.kafka.common.utils.Utils.mkSet;
 import static org.apache.kafka.streams.processor.internals.ClientUtils.consumerRecordSizeInBytes;
 import static org.apache.kafka.streams.processor.internals.ClientUtils.fetchCommittedOffsets;
 import static org.apache.kafka.streams.processor.internals.ClientUtils.fetchEndOffsets;
 import static org.apache.kafka.streams.processor.internals.ClientUtils.producerRecordSizeInBytes;
-
-import static org.easymock.EasyMock.expect;
-import static org.easymock.EasyMock.replay;
-import static org.easymock.EasyMock.verify;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+@ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.STRICT_STUBS)
 public class ClientUtilsTest {
 
     // consumer and producer records use utf8 encoding for topic name, header keys, etc
@@ -101,82 +106,80 @@ public class ClientUtilsTest {
         HEADERS_BYTES +
         RECORD_METADATA_BYTES;
 
-    private static final Set<TopicPartition> PARTITIONS = mkSet(
+    private static final Set<TopicPartition> PARTITIONS = Set.of(
         new TopicPartition(TOPIC, 1),
         new TopicPartition(TOPIC, 2)
     );
 
     @Test
     public void fetchCommittedOffsetsShouldRethrowKafkaExceptionAsStreamsException() {
-        final Consumer<byte[], byte[]> consumer = EasyMock.createMock(Consumer.class);
-        expect(consumer.committed(PARTITIONS)).andThrow(new KafkaException());
-        replay(consumer);
+        @SuppressWarnings("unchecked")
+        final Consumer<byte[], byte[]> consumer = mock(Consumer.class);
+        when(consumer.committed(PARTITIONS)).thenThrow(new KafkaException());
         assertThrows(StreamsException.class, () -> fetchCommittedOffsets(PARTITIONS, consumer));
     }
 
     @Test
     public void fetchCommittedOffsetsShouldRethrowTimeoutException() {
-        final Consumer<byte[], byte[]> consumer = EasyMock.createMock(Consumer.class);
-        expect(consumer.committed(PARTITIONS)).andThrow(new TimeoutException());
-        replay(consumer);
+        @SuppressWarnings("unchecked")
+        final Consumer<byte[], byte[]> consumer = mock(Consumer.class);
+        when(consumer.committed(PARTITIONS)).thenThrow(new TimeoutException());
         assertThrows(TimeoutException.class, () -> fetchCommittedOffsets(PARTITIONS, consumer));
     }
 
     @Test
     public void fetchCommittedOffsetsShouldReturnEmptyMapIfPartitionsAreEmpty() {
-        final Consumer<byte[], byte[]> consumer = EasyMock.createMock(Consumer.class);
+        @SuppressWarnings("unchecked")
+        final Consumer<byte[], byte[]> consumer = mock(Consumer.class);
         assertTrue(fetchCommittedOffsets(emptySet(), consumer).isEmpty());
     }
 
     @Test
     public void fetchEndOffsetsShouldReturnEmptyMapIfPartitionsAreEmpty() {
-        final Admin adminClient = EasyMock.createMock(AdminClient.class);
+        final Admin adminClient = mock(AdminClient.class);
         assertTrue(fetchEndOffsets(emptySet(), adminClient).isEmpty());
     }
 
     @Test
     public void fetchEndOffsetsShouldRethrowRuntimeExceptionAsStreamsException() throws Exception {
-        final Admin adminClient = EasyMock.createMock(AdminClient.class);
-        final ListOffsetsResult result = EasyMock.createNiceMock(ListOffsetsResult.class);
-        final KafkaFuture<Map<TopicPartition, ListOffsetsResultInfo>> allFuture = EasyMock.createMock(KafkaFuture.class);
+        final Admin adminClient = mock(AdminClient.class);
+        final ListOffsetsResult result = mock(ListOffsetsResult.class);
+        @SuppressWarnings("unchecked")
+        final KafkaFuture<Map<TopicPartition, ListOffsetsResultInfo>> allFuture = mock(KafkaFuture.class);
 
-        EasyMock.expect(adminClient.listOffsets(EasyMock.anyObject())).andStubReturn(result);
-        EasyMock.expect(result.all()).andStubReturn(allFuture);
-        EasyMock.expect(allFuture.get()).andThrow(new RuntimeException());
-        replay(adminClient, result, allFuture);
+        when(adminClient.listOffsets(any())).thenReturn(result);
+        when(result.all()).thenReturn(allFuture);
+        when(allFuture.get()).thenThrow(new RuntimeException());
 
         assertThrows(StreamsException.class, () -> fetchEndOffsets(PARTITIONS, adminClient));
-        verify(adminClient);
     }
 
     @Test
     public void fetchEndOffsetsShouldRethrowInterruptedExceptionAsStreamsException() throws Exception {
-        final Admin adminClient = EasyMock.createMock(AdminClient.class);
-        final ListOffsetsResult result = EasyMock.createNiceMock(ListOffsetsResult.class);
-        final KafkaFuture<Map<TopicPartition, ListOffsetsResultInfo>> allFuture = EasyMock.createMock(KafkaFuture.class);
+        final Admin adminClient = mock(AdminClient.class);
+        final ListOffsetsResult result = mock(ListOffsetsResult.class);
+        @SuppressWarnings("unchecked")
+        final KafkaFuture<Map<TopicPartition, ListOffsetsResultInfo>> allFuture = mock(KafkaFuture.class);
 
-        EasyMock.expect(adminClient.listOffsets(EasyMock.anyObject())).andStubReturn(result);
-        EasyMock.expect(result.all()).andStubReturn(allFuture);
-        EasyMock.expect(allFuture.get()).andThrow(new InterruptedException());
-        replay(adminClient, result, allFuture);
+        when(adminClient.listOffsets(any())).thenReturn(result);
+        when(result.all()).thenReturn(allFuture);
+        when(allFuture.get()).thenThrow(new InterruptedException());
 
         assertThrows(StreamsException.class, () -> fetchEndOffsets(PARTITIONS, adminClient));
-        verify(adminClient);
     }
 
     @Test
     public void fetchEndOffsetsShouldRethrowExecutionExceptionAsStreamsException() throws Exception {
-        final Admin adminClient = EasyMock.createMock(AdminClient.class);
-        final ListOffsetsResult result = EasyMock.createNiceMock(ListOffsetsResult.class);
-        final KafkaFuture<Map<TopicPartition, ListOffsetsResultInfo>> allFuture = EasyMock.createMock(KafkaFuture.class);
+        final Admin adminClient = mock(AdminClient.class);
+        final ListOffsetsResult result = mock(ListOffsetsResult.class);
+        @SuppressWarnings("unchecked")
+        final KafkaFuture<Map<TopicPartition, ListOffsetsResultInfo>> allFuture = mock(KafkaFuture.class);
 
-        EasyMock.expect(adminClient.listOffsets(EasyMock.anyObject())).andStubReturn(result);
-        EasyMock.expect(result.all()).andStubReturn(allFuture);
-        EasyMock.expect(allFuture.get()).andThrow(new ExecutionException(new RuntimeException()));
-        replay(adminClient, result, allFuture);
+        when(adminClient.listOffsets(any())).thenReturn(result);
+        when(result.all()).thenReturn(allFuture);
+        when(allFuture.get()).thenThrow(new ExecutionException(new RuntimeException()));
 
         assertThrows(StreamsException.class, () -> fetchEndOffsets(PARTITIONS, adminClient));
-        verify(adminClient);
     }
     
     @Test

@@ -19,17 +19,22 @@ package org.apache.kafka.common.security;
 import org.apache.kafka.common.config.SaslConfigs;
 import org.apache.kafka.common.config.types.Password;
 import org.apache.kafka.common.network.ListenerName;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.security.auth.login.AppConfigurationEntry;
-import javax.security.auth.login.Configuration;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import javax.security.auth.login.AppConfigurationEntry;
+import javax.security.auth.login.Configuration;
+
+import static org.apache.kafka.common.security.JaasUtils.DISALLOWED_LOGIN_MODULES_CONFIG;
+import static org.apache.kafka.common.security.JaasUtils.DISALLOWED_LOGIN_MODULES_DEFAULT;
 
 public class JaasContext {
 
@@ -72,7 +77,7 @@ public class JaasContext {
     /**
      * Returns an instance of this class.
      *
-     * If JAAS configuration property @link SaslConfigs#SASL_JAAS_CONFIG} is specified,
+     * If JAAS configuration property {@link SaslConfigs#SASL_JAAS_CONFIG} is specified,
      * the configuration object is created by parsing the property value. Otherwise, the default Configuration
      * is returned. The context name is always `KafkaClient`.
      *
@@ -91,9 +96,23 @@ public class JaasContext {
                 throw new IllegalArgumentException("JAAS config property does not contain any login modules");
             else if (contextModules.length != 1)
                 throw new IllegalArgumentException("JAAS config property contains " + contextModules.length + " login modules, should be 1 module");
+
+            throwIfLoginModuleIsNotAllowed(contextModules[0]);
             return new JaasContext(globalContextName, contextType, jaasConfig, dynamicJaasConfig);
         } else
             return defaultContext(contextType, listenerContextName, globalContextName);
+    }
+
+    private static void throwIfLoginModuleIsNotAllowed(AppConfigurationEntry appConfigurationEntry) {
+        Set<String> disallowedLoginModuleList = Arrays.stream(
+                System.getProperty(DISALLOWED_LOGIN_MODULES_CONFIG, DISALLOWED_LOGIN_MODULES_DEFAULT).split(","))
+                .map(String::trim)
+                .collect(Collectors.toSet());
+        String loginModuleName = appConfigurationEntry.getLoginModuleName().trim();
+        if (disallowedLoginModuleList.contains(loginModuleName)) {
+            throw new IllegalArgumentException(loginModuleName + " is not allowed. Update System property '"
+                    + DISALLOWED_LOGIN_MODULES_CONFIG + "' to allow " + loginModuleName);
+        }
     }
 
     private static JaasContext defaultContext(JaasContext.Type contextType, String listenerContextName,
@@ -131,6 +150,9 @@ public class JaasContext {
             throw new IllegalArgumentException(errorMessage);
         }
 
+        for (AppConfigurationEntry appConfigurationEntry : configEntries) {
+            throwIfLoginModuleIsNotAllowed(appConfigurationEntry);
+        }
         return new JaasContext(contextName, contextType, jaasConfig, null);
     }
 
@@ -153,7 +175,7 @@ public class JaasContext {
         AppConfigurationEntry[] entries = configuration.getAppConfigurationEntry(name);
         if (entries == null)
             throw new IllegalArgumentException("Could not find a '" + name + "' entry in this JAAS configuration.");
-        this.configurationEntries = Collections.unmodifiableList(new ArrayList<>(Arrays.asList(entries)));
+        this.configurationEntries = List.of(entries);
         this.dynamicJaasConfig = dynamicJaasConfig;
     }
 

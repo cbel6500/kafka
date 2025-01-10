@@ -18,31 +18,31 @@
 package kafka.server.metadata
 
 import java.util
-import java.util.Collections
+import java.util.{Collections, Optional}
 import java.util.concurrent.locks.{ReentrantLock, ReentrantReadWriteLock}
-import kafka.admin.BrokerMetadata
-
 import scala.collection.{Seq, Set, mutable}
 import scala.jdk.CollectionConverters._
 import kafka.cluster.{Broker, EndPoint}
-import kafka.api._
 import kafka.controller.StateChangeLogger
-import kafka.server.{BrokerFeatures, FinalizedFeaturesAndEpoch, MetadataCache}
+import kafka.server.{CachedControllerId, KRaftCachedControllerId, MetadataCache, ZkCachedControllerId}
 import kafka.utils.CoreUtils._
 import kafka.utils.Logging
-import kafka.utils.Implicits._
+import org.apache.kafka.admin.BrokerMetadata
 import org.apache.kafka.common.internals.Topic
-import org.apache.kafka.common.message.UpdateMetadataRequestData.UpdateMetadataPartitionState
+import org.apache.kafka.common.message.UpdateMetadataRequestData.{UpdateMetadataPartitionState, UpdateMetadataTopicState}
 import org.apache.kafka.common.{Cluster, Node, PartitionInfo, TopicPartition, Uuid}
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponseTopic
 import org.apache.kafka.common.message.MetadataResponseData.MetadataResponsePartition
+import org.apache.kafka.common.message.UpdateMetadataRequestData
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.Errors
-import org.apache.kafka.common.requests.{ApiVersionsResponse, MetadataResponse, UpdateMetadataRequest}
+import org.apache.kafka.common.requests.{AbstractControlRequest, ApiVersionsResponse, MetadataResponse, UpdateMetadataRequest}
 import org.apache.kafka.common.security.auth.SecurityProtocol
-import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.metadata.LeaderAndIsr
+import org.apache.kafka.server.BrokerFeatures
+import org.apache.kafka.server.common.{FinalizedFeatures, MetadataVersion}
 
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{ThreadLocalRandom, TimeUnit}
 import scala.concurrent.TimeoutException
 import scala.math.max
 
@@ -53,14 +53,111 @@ class FeatureCacheUpdateException(message: String) extends RuntimeException(mess
 trait ZkFinalizedFeatureCache {
   def waitUntilFeatureEpochOrThrow(minExpectedEpoch: Long, timeoutMs: Long): Unit
 
-  def getFeatureOption: Option[FinalizedFeaturesAndEpoch]
+  def getFeatureOption: Option[FinalizedFeatures]
+}
+
+case class MetadataSnapshot(partitionStates: mutable.AnyRefMap[String, mutable.LongMap[UpdateMetadataPartitionState]],
+                            topicIds: Map[String, Uuid],
+                            controllerId: Option[CachedControllerId],
+                            aliveBrokers: mutable.LongMap[Broker],
+                            aliveNodes: mutable.LongMap[collection.Map[ListenerName, Node]]) {
+  val topicNames: Map[Uuid, String] = topicIds.map { case (topicName, topicId) => (topicId, topicName) }
+}
+
+object ZkMetadataCache {
+  def transformKRaftControllerFullMetadataRequest(
+    currentMetadata: MetadataSnapshot,
+    requestControllerEpoch: Int,
+    requestTopicStates: util.List[UpdateMetadataTopicState],
+    handleLogMessage: String => Unit,
+  ): util.List[UpdateMetadataTopicState] = {
+    val topicIdToNewState = new util.HashMap[Uuid, UpdateMetadataTopicState]()
+    requestTopicStates.forEach(state => topicIdToNewState.put(state.topicId(), state))
+    val newRequestTopicStates = new util.ArrayList[UpdateMetadataTopicState]()
+    currentMetadata.topicNames.foreachEntry((id, name) => {
+      try {
+        Option(topicIdToNewState.get(id)) match {
+          case None =>
+            currentMetadata.partitionStates.get(name) match {
+              case None => handleLogMessage(s"Error: topic $name appeared in currentMetadata.topicNames, " +
+                "but not in currentMetadata.partitionStates.")
+              case Some(curPartitionStates) =>
+                handleLogMessage(s"Removing topic $name with ID $id from the metadata cache since " +
+                  "the full UMR did not include it.")
+                newRequestTopicStates.add(createDeletionEntries(name,
+                  id,
+                  curPartitionStates.values,
+                  requestControllerEpoch))
+            }
+          case Some(newTopicState) =>
+            val indexToState = new util.HashMap[Integer, UpdateMetadataPartitionState]
+            newTopicState.partitionStates().forEach(part => indexToState.put(part.partitionIndex, part))
+            currentMetadata.partitionStates.get(name) match {
+              case None => handleLogMessage(s"Error: topic $name appeared in currentMetadata.topicNames, " +
+                "but not in currentMetadata.partitionStates.")
+              case Some(curPartitionStates) =>
+                curPartitionStates.foreach(state => indexToState.remove(state._1.toInt))
+                if (!indexToState.isEmpty) {
+                  handleLogMessage(s"Removing ${indexToState.size()} partition(s) from topic $name with " +
+                    s"ID $id from the metadata cache since the full UMR did not include them.")
+                  newRequestTopicStates.add(createDeletionEntries(name,
+                    id,
+                    indexToState.values().asScala,
+                    requestControllerEpoch))
+                }
+            }
+        }
+      } catch {
+        case e: Exception => handleLogMessage(s"Error: $e")
+      }
+    })
+    if (newRequestTopicStates.isEmpty) {
+      // If the output is the same as the input, optimize by just returning the input.
+      requestTopicStates
+    } else {
+      // If the output has some new entries, they should all appear at the beginning. This will
+      // ensure that the old stuff is cleared out before the new stuff is added. We will need a
+      // new list for this, of course.
+      newRequestTopicStates.addAll(requestTopicStates)
+      newRequestTopicStates
+    }
+  }
+
+  def createDeletionEntries(
+    topicName: String,
+    topicId: Uuid,
+    partitions: Iterable[UpdateMetadataPartitionState],
+    requestControllerEpoch: Int
+  ): UpdateMetadataTopicState = {
+    val topicState = new UpdateMetadataRequestData.UpdateMetadataTopicState()
+      .setTopicId(topicId)
+      .setTopicName(topicName)
+      .setPartitionStates(new util.ArrayList())
+    partitions.foreach(partition => {
+      val lisr = LeaderAndIsr.duringDelete(partition.isr())
+      val newPartitionState = new UpdateMetadataPartitionState()
+        .setPartitionIndex(partition.partitionIndex())
+        .setTopicName(topicName)
+        .setLeader(lisr.leader)
+        .setLeaderEpoch(lisr.leaderEpoch)
+        .setControllerEpoch(requestControllerEpoch)
+        .setReplicas(partition.replicas())
+        .setZkVersion(lisr.partitionEpoch)
+        .setIsr(lisr.isr)
+      topicState.partitionStates().add(newPartitionState)
+    })
+    topicState
+  }
 }
 
 /**
  *  A cache for the state (e.g., current leader) of each partition. This cache is updated through
  *  UpdateMetadataRequest from the controller. Every broker maintains the same cache, asynchronously.
  */
-class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFeatures: BrokerFeatures)
+class ZkMetadataCache(
+  brokerId: Int,
+  metadataVersion: MetadataVersion,
+  brokerFeatures: BrokerFeatures)
   extends MetadataCache with ZkFinalizedFeatureCache with Logging {
 
   private val partitionMetadataLock = new ReentrantReadWriteLock()
@@ -68,14 +165,18 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
   //replace the value with a completely new one. this means reads (which are not under any lock) need to grab
   //the value of this var (into a val) ONCE and retain that read copy for the duration of their operation.
   //multiple reads of this value risk getting different snapshots.
-  @volatile private var metadataSnapshot: MetadataSnapshot = MetadataSnapshot(partitionStates = mutable.AnyRefMap.empty,
-    topicIds = Map.empty, controllerId = None, aliveBrokers = mutable.LongMap.empty, aliveNodes = mutable.LongMap.empty)
+  @volatile private var metadataSnapshot: MetadataSnapshot = MetadataSnapshot(
+    partitionStates = mutable.AnyRefMap.empty,
+    topicIds = Map.empty,
+    controllerId = None,
+    aliveBrokers = mutable.LongMap.empty,
+    aliveNodes = mutable.LongMap.empty)
 
   this.logIdent = s"[MetadataCache brokerId=$brokerId] "
   private val stateChangeLogger = new StateChangeLogger(brokerId, inControllerContext = false, None)
 
   // Features are updated via ZK notification (see FinalizedFeatureChangeListener)
-  @volatile private var featuresAndEpoch: Option[FinalizedFeaturesAndEpoch] = Option.empty
+  @volatile private var _features: Option[FinalizedFeatures] = Option.empty
   private val featureLock = new ReentrantLock()
   private val featureCond = featureLock.newCondition()
 
@@ -237,22 +338,23 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
     }.toMap
   }
 
-  def getNonExistingTopics(topics: Set[String]): Set[String] = {
-    topics.diff(metadataSnapshot.partitionStates.keySet)
-  }
-
   override def hasAliveBroker(brokerId: Int): Boolean = metadataSnapshot.aliveBrokers.contains(brokerId)
 
   override def getAliveBrokers(): Iterable[BrokerMetadata] = {
-    metadataSnapshot.aliveBrokers.values.map(b => new BrokerMetadata(b.id, b.rack))
+    metadataSnapshot.aliveBrokers.values.map(b => new BrokerMetadata(b.id, Optional.ofNullable(b.rack.orNull)))
   }
 
   override def getAliveBrokerNode(brokerId: Int, listenerName: ListenerName): Option[Node] = {
-    metadataSnapshot.aliveBrokers.get(brokerId).flatMap(_.getNode(listenerName))
+    val snapshot = metadataSnapshot
+    snapshot.aliveBrokers.get(brokerId).flatMap(_.getNode(listenerName))
   }
 
   override def getAliveBrokerNodes(listenerName: ListenerName): Iterable[Node] = {
     metadataSnapshot.aliveBrokers.values.flatMap(_.getNode(listenerName))
+  }
+
+  override def getBrokerNodes(listenerName: ListenerName): Iterable[Node] = {
+    getAliveBrokerNodes(listenerName)
   }
 
   def getTopicId(topicName: String): Uuid = {
@@ -315,7 +417,14 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
     }.getOrElse(Map.empty[Int, Node])
   }
 
-  def getControllerId: Option[Int] = metadataSnapshot.controllerId
+  def getControllerId: Option[CachedControllerId] = {
+    metadataSnapshot.controllerId
+  }
+
+  def getRandomAliveBrokerId: Option[Int] = {
+    val aliveBrokers = metadataSnapshot.aliveBrokers.values.toList
+    Some(aliveBrokers(ThreadLocalRandom.current().nextInt(aliveBrokers.size)).id)
+  }
 
   def getClusterMetadata(clusterId: String, listenerName: ListenerName): Cluster = {
     val snapshot = metadataSnapshot
@@ -329,8 +438,15 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
       nodes.getOrElse(id.toLong, new Node(id, "", -1))
     }
 
+    def controllerId(snapshot: MetadataSnapshot): Option[Node] = {
+      snapshot.controllerId.flatMap {
+        case ZkCachedControllerId(id) => getAliveBrokerNode(id, listenerName)
+        case KRaftCachedControllerId(_) => getRandomAliveBrokerId.flatMap(getAliveBrokerNode(_, listenerName))
+      }
+    }
+
     val partitions = getAllPartitions(snapshot)
-      .filter { case (_, state) => state.leader != LeaderAndIsr.LeaderDuringDelete }
+      .filter { case (_, state) => state.leader != LeaderAndIsr.LEADER_DURING_DELETE }
       .map { case (tp, state) =>
         new PartitionInfo(tp.topic, tp.partition, node(state.leader),
           state.replicas.asScala.map(node).toArray,
@@ -342,18 +458,71 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
     new Cluster(clusterId, nodes.values.toBuffer.asJava,
       partitions.toBuffer.asJava,
       unauthorizedTopics, internalTopics,
-      snapshot.controllerId.map(id => node(id)).orNull)
+      controllerId(snapshot).orNull)
   }
 
-  // This method returns the deleted TopicPartitions received from UpdateMetadataRequest
-  def updateMetadata(correlationId: Int, updateMetadataRequest: UpdateMetadataRequest): Seq[TopicPartition] = {
+  // This method returns the deleted TopicPartitions received from UpdateMetadataRequest.
+  // Note: if this ZK broker is migrating to KRaft, a singular UMR may sometimes both delete a
+  // partition and re-create a new partition with that same name. In that case, it will not appear
+  // in the return value of this function.
+  def updateMetadata(
+    correlationId: Int,
+    originalUpdateMetadataRequest: UpdateMetadataRequest
+  ): Seq[TopicPartition] = {
+    var updateMetadataRequest = originalUpdateMetadataRequest
     inWriteLock(partitionMetadataLock) {
+      if (
+        updateMetadataRequest.isKRaftController &&
+        updateMetadataRequest.updateType() == AbstractControlRequest.Type.FULL
+      ) {
+        if (updateMetadataRequest.version() < 8) {
+          stateChangeLogger.error(s"Received UpdateMetadataRequest with Type=FULL (2), but version of " +
+            updateMetadataRequest.version() + ", which should not be possible. Not treating this as a full " +
+            "metadata update")
+        } else {
+          // When handling a UMR from a KRaft controller, we may have to insert some partition
+          // deletions at the beginning, to handle the different way topic deletion works in KRaft
+          // mode (and also migration mode).
+          //
+          // After we've done that, we re-create the whole UpdateMetadataRequest object using the
+          // updated list of topic info. This ensures that UpdateMetadataRequest.normalize is called
+          // on the new, updated topic data. Note that we don't mutate the old request object; it may
+          // be used elsewhere.
+          val newTopicStates = ZkMetadataCache.transformKRaftControllerFullMetadataRequest(
+            metadataSnapshot,
+            updateMetadataRequest.controllerEpoch(),
+            updateMetadataRequest.topicStates(),
+            logMessage => if (logMessage.startsWith("Error")) {
+              stateChangeLogger.error(logMessage)
+            } else {
+              stateChangeLogger.info(logMessage)
+            })
+
+          // It would be nice if we could call duplicate() here, but we don't want to copy the
+          // old topicStates array. That would be quite costly, and we're not going to use it anyway.
+          // Instead, we copy each field that we need.
+          val originalRequestData = updateMetadataRequest.data()
+          val newData = new UpdateMetadataRequestData().
+            setControllerId(originalRequestData.controllerId()).
+            setIsKRaftController(originalRequestData.isKRaftController).
+            setType(originalRequestData.`type`()).
+            setControllerEpoch(originalRequestData.controllerEpoch()).
+            setBrokerEpoch(originalRequestData.brokerEpoch()).
+            setTopicStates(newTopicStates).
+            setLiveBrokers(originalRequestData.liveBrokers())
+          updateMetadataRequest = new UpdateMetadataRequest(newData, updateMetadataRequest.version())
+        }
+      }
 
       val aliveBrokers = new mutable.LongMap[Broker](metadataSnapshot.aliveBrokers.size)
       val aliveNodes = new mutable.LongMap[collection.Map[ListenerName, Node]](metadataSnapshot.aliveNodes.size)
-      val controllerIdOpt = updateMetadataRequest.controllerId match {
+      val controllerIdOpt: Option[CachedControllerId] = updateMetadataRequest.controllerId match {
         case id if id < 0 => None
-        case id => Some(id)
+        case id =>
+          if (updateMetadataRequest.isKRaftController)
+            Some(KRaftCachedControllerId(id))
+          else
+            Some(ZkCachedControllerId(id))
       }
 
       updateMetadataRequest.liveBrokers.forEach { broker =>
@@ -365,7 +534,7 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
         broker.endpoints.forEach { ep =>
           val listenerName = new ListenerName(ep.listener)
           endPoints += new EndPoint(ep.host, ep.port, listenerName, SecurityProtocol.forId(ep.securityProtocol))
-          nodes.put(listenerName, new Node(broker.id, ep.host, ep.port))
+          nodes.put(listenerName, new Node(broker.id, ep.host, ep.port, broker.rack()))
         }
         aliveBrokers(broker.id) = Broker(broker.id, endPoints, Option(broker.rack))
         aliveNodes(broker.id) = nodes.asScala
@@ -384,13 +553,14 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
       newZeroIds.foreach { case (zeroIdTopic, _) => topicIds.remove(zeroIdTopic) }
       topicIds ++= newTopicIds.toMap
 
-      val deletedPartitions = new mutable.ArrayBuffer[TopicPartition]
+      val deletedPartitions = new java.util.LinkedHashSet[TopicPartition]
       if (!updateMetadataRequest.partitionStates.iterator.hasNext) {
-        metadataSnapshot = MetadataSnapshot(metadataSnapshot.partitionStates, topicIds.toMap, controllerIdOpt, aliveBrokers, aliveNodes)
+        metadataSnapshot = MetadataSnapshot(metadataSnapshot.partitionStates, topicIds.toMap,
+          controllerIdOpt, aliveBrokers, aliveNodes)
       } else {
         //since kafka may do partial metadata updates, we start by copying the previous state
         val partitionStates = new mutable.AnyRefMap[String, mutable.LongMap[UpdateMetadataPartitionState]](metadataSnapshot.partitionStates.size)
-        metadataSnapshot.partitionStates.forKeyValue { (topic, oldPartitionStates) =>
+        metadataSnapshot.partitionStates.foreachEntry { (topic, oldPartitionStates) =>
           val copy = new mutable.LongMap[UpdateMetadataPartitionState](oldPartitionStates.size)
           copy ++= oldPartitionStates
           partitionStates(topic) = copy
@@ -403,14 +573,15 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
         newStates.foreach { state =>
           // per-partition logging here can be very expensive due going through all partitions in the cluster
           val tp = new TopicPartition(state.topicName, state.partitionIndex)
-          if (state.leader == LeaderAndIsr.LeaderDuringDelete) {
+          if (state.leader == LeaderAndIsr.LEADER_DURING_DELETE) {
             removePartitionInfo(partitionStates, topicIds, tp.topic, tp.partition)
             if (traceEnabled)
               stateChangeLogger.trace(s"Deleted partition $tp from metadata cache in response to UpdateMetadata " +
                 s"request sent by controller $controllerId epoch $controllerEpoch with correlation id $correlationId")
-            deletedPartitions += tp
+            deletedPartitions.add(tp)
           } else {
             addOrUpdatePartitionInfo(partitionStates, tp.topic, tp.partition, state)
+            deletedPartitions.remove(tp)
             if (traceEnabled)
               stateChangeLogger.trace(s"Cached leader info $state for partition $tp in response to " +
                 s"UpdateMetadata request sent by controller $controllerId epoch $controllerEpoch with correlation id $correlationId")
@@ -422,7 +593,7 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
 
         metadataSnapshot = MetadataSnapshot(partitionStates, topicIds.toMap, controllerIdOpt, aliveBrokers, aliveNodes)
       }
-      deletedPartitions
+      deletedPartitions.asScala.toSeq
     }
   }
 
@@ -444,21 +615,14 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
     }
   }
 
-  case class MetadataSnapshot(partitionStates: mutable.AnyRefMap[String, mutable.LongMap[UpdateMetadataPartitionState]],
-                              topicIds: Map[String, Uuid],
-                              controllerId: Option[Int],
-                              aliveBrokers: mutable.LongMap[Broker],
-                              aliveNodes: mutable.LongMap[collection.Map[ListenerName, Node]]) {
-    val topicNames: Map[Uuid, String] = topicIds.map { case (topicName, topicId) => (topicId, topicName) }
-  }
-
   override def metadataVersion(): MetadataVersion = metadataVersion
 
-  override def features(): FinalizedFeaturesAndEpoch = {
-    featuresAndEpoch match {
-      case Some(features) => features
-      case None => FinalizedFeaturesAndEpoch(Map.empty, ApiVersionsResponse.UNKNOWN_FINALIZED_FEATURES_EPOCH)
-    }
+  override def features(): FinalizedFeatures = _features match {
+    case Some(features) => features
+    case None => new FinalizedFeatures(metadataVersion,
+      Collections.emptyMap(),
+      ApiVersionsResponse.UNKNOWN_FINALIZED_FEATURES_EPOCH,
+      false)
   }
 
   /**
@@ -475,15 +639,19 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
    *                         not modified.
    */
   def updateFeaturesOrThrow(latestFeatures: Map[String, Short], latestEpoch: Long): Unit = {
-    val latest = FinalizedFeaturesAndEpoch(latestFeatures, latestEpoch)
-    val existing = featuresAndEpoch.map(item => item.toString()).getOrElse("<empty>")
-    if (featuresAndEpoch.isDefined && featuresAndEpoch.get.epoch > latest.epoch) {
+    val latest = new FinalizedFeatures(metadataVersion,
+      latestFeatures.map(kv => (kv._1, kv._2.asInstanceOf[java.lang.Short])).asJava,
+      latestEpoch,
+      false)
+    val existing = _features
+    if (existing.isDefined && existing.get.finalizedFeaturesEpoch() > latest.finalizedFeaturesEpoch()) {
       val errorMsg = s"FinalizedFeatureCache update failed due to invalid epoch in new $latest." +
         s" The existing cache contents are $existing."
       throw new FeatureCacheUpdateException(errorMsg)
     } else {
-      val incompatibleFeatures = brokerFeatures.incompatibleFeatures(latest.features)
-      if (incompatibleFeatures.nonEmpty) {
+      val incompatibleFeatures = brokerFeatures.incompatibleFeatures(
+        latest.finalizedFeatures().asScala.map(kv => (kv._1, kv._2.toShort: java.lang.Short)).toMap.asJava)
+      if (!incompatibleFeatures.isEmpty) {
         val errorMsg = "FinalizedFeatureCache update failed since feature compatibility" +
           s" checks failed! Supported ${brokerFeatures.supportedFeatures} has incompatibilities" +
           s" with the latest $latest."
@@ -491,7 +659,7 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
       } else {
         val logMsg = s"Updated cache from existing $existing to latest $latest."
         inLock(featureLock) {
-          featuresAndEpoch = Some(latest)
+          _features = Some(latest)
           featureCond.signalAll()
         }
         info(logMsg)
@@ -499,13 +667,12 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
     }
   }
 
-
   /**
    * Clears all existing finalized features and epoch from the cache.
    */
   def clearFeatures(): Unit = {
     inLock(featureLock) {
-      featuresAndEpoch = None
+      _features = None
       featureCond.signalAll()
     }
   }
@@ -521,22 +688,22 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
    *                           minExpectedEpoch within timeoutMs.
    */
   def waitUntilFeatureEpochOrThrow(minExpectedEpoch: Long, timeoutMs: Long): Unit = {
-    if(minExpectedEpoch < 0L) {
+    if (minExpectedEpoch < 0L) {
       throw new IllegalArgumentException(
         s"Expected minExpectedEpoch >= 0, but $minExpectedEpoch was provided.")
     }
 
-    if(timeoutMs < 0L) {
+    if (timeoutMs < 0L) {
       throw new IllegalArgumentException(s"Expected timeoutMs >= 0, but $timeoutMs was provided.")
     }
     val waitEndTimeNanos = System.nanoTime() + (timeoutMs * 1000000)
     inLock(featureLock) {
-      while (!(featuresAndEpoch.isDefined && featuresAndEpoch.get.epoch >= minExpectedEpoch)) {
+      while (!(_features.isDefined && _features.get.finalizedFeaturesEpoch() >= minExpectedEpoch)) {
         val nowNanos = System.nanoTime()
         if (nowNanos > waitEndTimeNanos) {
           throw new TimeoutException(
             s"Timed out after waiting for ${timeoutMs}ms for required condition to be met." +
-              s" Current epoch: ${featuresAndEpoch.map(fe => fe.epoch).getOrElse("<none>")}.")
+              s" Current epoch: ${_features.map(fe => fe.finalizedFeaturesEpoch()).getOrElse("<none>")}.")
         }
         val sleepTimeMs = max(1L, (waitEndTimeNanos - nowNanos) / 1000000)
         featureCond.await(sleepTimeMs, TimeUnit.MILLISECONDS)
@@ -544,10 +711,5 @@ class ZkMetadataCache(brokerId: Int, metadataVersion: MetadataVersion, brokerFea
     }
   }
 
-  /**
-   * @return   the latest known FinalizedFeaturesAndEpoch or empty if not defined in the cache.
-   */
-  def getFeatureOption: Option[FinalizedFeaturesAndEpoch] = {
-    featuresAndEpoch
-  }
+  override def getFeatureOption: Option[FinalizedFeatures] = _features
 }

@@ -49,6 +49,7 @@ import org.apache.kafka.server.authorizer.AuthorizationResult;
 import org.apache.kafka.server.authorizer.AuthorizerServerInfo;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.timeline.SnapshotRegistry;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -71,10 +72,10 @@ import static org.apache.kafka.common.resource.PatternType.LITERAL;
 import static org.apache.kafka.common.resource.PatternType.MATCH;
 import static org.apache.kafka.common.resource.ResourceType.TOPIC;
 import static org.apache.kafka.metadata.authorizer.StandardAclWithIdTest.TEST_ACLS;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 
 @Timeout(value = 40)
@@ -111,6 +112,34 @@ public class AclControlManagerTest {
                     new ResourcePattern(TOPIC, "*", LITERAL),
                     new AccessControlEntry("User:*", "*", ALTER, AclPermissionType.UNKNOWN)))).
                 getMessage());
+    }
+
+    /**
+     * Verify that validateNewAcl catches invalid ACLs with principals that do not contain a colon.
+     */
+    @Test
+    public void testValidateAclWithBadPrincipal() {
+        assertEquals("Could not parse principal from `invalid` (no colon is present " +
+                "separating the principal type from the principal name)",
+            assertThrows(InvalidRequestException.class, () ->
+                AclControlManager.validateNewAcl(new AclBinding(
+                    new ResourcePattern(TOPIC, "*", LITERAL),
+                    new AccessControlEntry("invalid", "*", ALTER, ALLOW)))).
+                getMessage());
+    }
+
+    /**
+     * Verify that validateNewAcl catches invalid ACLs with principals that do not contain a colon.
+     */
+    @Test
+    public void testValidateAclWithEmptyPrincipal() {
+        assertEquals("Could not parse principal from `` (no colon is present " +
+                "separating the principal type from the principal name)",
+            assertThrows(InvalidRequestException.class, () ->
+                AclControlManager.validateNewAcl(new AclBinding(
+                    new ResourcePattern(TOPIC, "*", LITERAL),
+                    new AccessControlEntry("", "*", ALTER, ALLOW)))).
+                        getMessage());
     }
 
     /**
@@ -202,24 +231,24 @@ public class AclControlManagerTest {
     @Test
     public void testLoadSnapshot() {
         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
-        snapshotRegistry.getOrCreateSnapshot(0);
-        AclControlManager manager = new AclControlManager(snapshotRegistry, Optional.empty());
+        snapshotRegistry.idempotentCreateSnapshot(0);
+        AclControlManager manager = new AclControlManager.Builder().
+            setSnapshotRegistry(snapshotRegistry).
+            build();
 
         // Load TEST_ACLS into the AclControlManager.
         Set<ApiMessageAndVersion> loadedAcls = new HashSet<>();
         for (StandardAclWithId acl : TEST_ACLS) {
             AccessControlEntryRecord record = acl.toRecord();
             assertTrue(loadedAcls.add(new ApiMessageAndVersion(record, (short) 0)));
-            manager.replay(acl.toRecord(), Optional.empty());
+            manager.replay(acl.toRecord());
         }
 
         // Verify that the ACLs stored in the AclControlManager match the ones we expect.
         Set<ApiMessageAndVersion> foundAcls = new HashSet<>();
-        for (Iterator<List<ApiMessageAndVersion>> iterator = manager.iterator(Long.MAX_VALUE);
-                 iterator.hasNext(); ) {
-            for (ApiMessageAndVersion apiMessageAndVersion : iterator.next()) {
-                assertTrue(foundAcls.add(apiMessageAndVersion));
-            }
+        for (Map.Entry<Uuid, StandardAcl> entry : manager.idToAcl().entrySet()) {
+            foundAcls.add(new ApiMessageAndVersion(
+                    new StandardAclWithId(entry.getKey(), entry.getValue()).toRecord(), (short) 0));
         }
         assertEquals(loadedAcls, foundAcls);
 
@@ -233,27 +262,23 @@ public class AclControlManagerTest {
         // a cluster metadata authorizer.
         snapshotRegistry.revertToSnapshot(0);
         authorizer.loadSnapshot(manager.idToAcl());
-        assertFalse(manager.iterator(Long.MAX_VALUE).hasNext());
+        assertTrue(manager.idToAcl().isEmpty());
     }
 
     @Test
     public void testAddAndDelete() {
-        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
-        AclControlManager manager = new AclControlManager(snapshotRegistry, Optional.empty());
+        AclControlManager manager = new AclControlManager.Builder().build();
         MockClusterMetadataAuthorizer authorizer = new MockClusterMetadataAuthorizer();
         authorizer.loadSnapshot(manager.idToAcl());
-        manager.replay(StandardAclWithIdTest.TEST_ACLS.get(0).toRecord(), Optional.empty());
-        assertEquals(new ApiMessageAndVersion(TEST_ACLS.get(0).toRecord(), (short) 0),
-            manager.iterator(Long.MAX_VALUE).next().get(0));
+        manager.replay(StandardAclWithIdTest.TEST_ACLS.get(0).toRecord());
         manager.replay(new RemoveAccessControlEntryRecord().
-            setId(TEST_ACLS.get(0).id()), Optional.empty());
-        assertFalse(manager.iterator(Long.MAX_VALUE).hasNext());
+            setId(TEST_ACLS.get(0).id()));
+        assertTrue(manager.idToAcl().isEmpty());
     }
 
     @Test
     public void testCreateAclDeleteAcl() {
-        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
-        AclControlManager manager = new AclControlManager(snapshotRegistry, Optional.empty());
+        AclControlManager manager = new AclControlManager.Builder().build();
         MockClusterMetadataAuthorizer authorizer = new MockClusterMetadataAuthorizer();
         authorizer.loadSnapshot(manager.idToAcl());
 
@@ -284,7 +309,7 @@ public class AclControlManagerTest {
             }
         }
         RecordTestUtils.replayAll(manager, createResult.records());
-        assertTrue(manager.iterator(Long.MAX_VALUE).hasNext());
+        assertFalse(manager.idToAcl().isEmpty());
 
         ControllerResult<List<AclDeleteResult>> deleteResult =
             manager.deleteAcls(Arrays.asList(
@@ -308,35 +333,30 @@ public class AclControlManagerTest {
             deleteResult.response().get(1).exception().get().getClass());
         RecordTestUtils.replayAll(manager, deleteResult.records());
 
-        Iterator<List<ApiMessageAndVersion>> iterator = manager.iterator(Long.MAX_VALUE);
-        assertTrue(iterator.hasNext());
-        List<ApiMessageAndVersion> list = iterator.next();
-        assertEquals(1, list.size());
-        assertEquals(TEST_ACLS.get(1).toBinding(), StandardAcl.fromRecord(
-            (AccessControlEntryRecord) list.get(0).message()).toBinding());
+        Iterator<Map.Entry<Uuid, StandardAcl>> iterator = manager.idToAcl().entrySet().iterator();
+        assertEquals(TEST_ACLS.get(1).acl(), iterator.next().getValue());
         assertFalse(iterator.hasNext());
     }
 
     @Test
     public void testDeleteDedupe() {
-        SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
-        AclControlManager manager = new AclControlManager(snapshotRegistry, Optional.empty());
+        AclControlManager manager = new AclControlManager.Builder().build();
         MockClusterMetadataAuthorizer authorizer = new MockClusterMetadataAuthorizer();
         authorizer.loadSnapshot(manager.idToAcl());
 
         AclBinding aclBinding = new AclBinding(new ResourcePattern(TOPIC, "topic-1", LITERAL),
                 new AccessControlEntry("User:user", "10.0.0.1", AclOperation.ALL, ALLOW));
 
-        ControllerResult<List<AclCreateResult>> createResult = manager.createAcls(Arrays.asList(aclBinding));
+        ControllerResult<List<AclCreateResult>> createResult = manager.createAcls(Collections.singletonList(aclBinding));
         Uuid id = ((AccessControlEntryRecord) createResult.records().get(0).message()).id();
         assertEquals(1, createResult.records().size());
 
-        ControllerResult<List<AclDeleteResult>> deleteAclResultsAnyFilter = manager.deleteAcls(Arrays.asList(AclBindingFilter.ANY));
+        ControllerResult<List<AclDeleteResult>> deleteAclResultsAnyFilter = manager.deleteAcls(Collections.singletonList(AclBindingFilter.ANY));
         assertEquals(1, deleteAclResultsAnyFilter.records().size());
         assertEquals(id, ((RemoveAccessControlEntryRecord) deleteAclResultsAnyFilter.records().get(0).message()).id());
         assertEquals(1, deleteAclResultsAnyFilter.response().size());
 
-        ControllerResult<List<AclDeleteResult>> deleteAclResultsSpecificFilter = manager.deleteAcls(Arrays.asList(aclBinding.toFilter()));
+        ControllerResult<List<AclDeleteResult>> deleteAclResultsSpecificFilter = manager.deleteAcls(Collections.singletonList(aclBinding.toFilter()));
         assertEquals(1, deleteAclResultsSpecificFilter.records().size());
         assertEquals(id, ((RemoveAccessControlEntryRecord) deleteAclResultsSpecificFilter.records().get(0).message()).id());
         assertEquals(1, deleteAclResultsSpecificFilter.response().size());

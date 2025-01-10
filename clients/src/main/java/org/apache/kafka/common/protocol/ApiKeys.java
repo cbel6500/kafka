@@ -17,6 +17,7 @@
 package org.apache.kafka.common.protocol;
 
 import org.apache.kafka.common.message.ApiMessageType;
+import org.apache.kafka.common.message.ApiVersionsResponseData;
 import org.apache.kafka.common.protocol.types.Schema;
 import org.apache.kafka.common.protocol.types.Type;
 import org.apache.kafka.common.record.RecordBatch;
@@ -27,6 +28,7 @@ import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -108,7 +110,30 @@ public enum ApiKeys {
     UNREGISTER_BROKER(ApiMessageType.UNREGISTER_BROKER, false, RecordBatch.MAGIC_VALUE_V0, true),
     DESCRIBE_TRANSACTIONS(ApiMessageType.DESCRIBE_TRANSACTIONS),
     LIST_TRANSACTIONS(ApiMessageType.LIST_TRANSACTIONS),
-    ALLOCATE_PRODUCER_IDS(ApiMessageType.ALLOCATE_PRODUCER_IDS, true, true);
+    ALLOCATE_PRODUCER_IDS(ApiMessageType.ALLOCATE_PRODUCER_IDS, true, true),
+    CONSUMER_GROUP_HEARTBEAT(ApiMessageType.CONSUMER_GROUP_HEARTBEAT),
+    CONSUMER_GROUP_DESCRIBE(ApiMessageType.CONSUMER_GROUP_DESCRIBE),
+    CONTROLLER_REGISTRATION(ApiMessageType.CONTROLLER_REGISTRATION),
+    GET_TELEMETRY_SUBSCRIPTIONS(ApiMessageType.GET_TELEMETRY_SUBSCRIPTIONS),
+    PUSH_TELEMETRY(ApiMessageType.PUSH_TELEMETRY),
+    ASSIGN_REPLICAS_TO_DIRS(ApiMessageType.ASSIGN_REPLICAS_TO_DIRS),
+    LIST_CLIENT_METRICS_RESOURCES(ApiMessageType.LIST_CLIENT_METRICS_RESOURCES),
+    DESCRIBE_TOPIC_PARTITIONS(ApiMessageType.DESCRIBE_TOPIC_PARTITIONS),
+    SHARE_GROUP_HEARTBEAT(ApiMessageType.SHARE_GROUP_HEARTBEAT),
+    SHARE_GROUP_DESCRIBE(ApiMessageType.SHARE_GROUP_DESCRIBE),
+    SHARE_FETCH(ApiMessageType.SHARE_FETCH),
+    SHARE_ACKNOWLEDGE(ApiMessageType.SHARE_ACKNOWLEDGE),
+    ADD_RAFT_VOTER(ApiMessageType.ADD_RAFT_VOTER, false, RecordBatch.MAGIC_VALUE_V0, true),
+    REMOVE_RAFT_VOTER(ApiMessageType.REMOVE_RAFT_VOTER, false, RecordBatch.MAGIC_VALUE_V0, true),
+    UPDATE_RAFT_VOTER(ApiMessageType.UPDATE_RAFT_VOTER),
+    INITIALIZE_SHARE_GROUP_STATE(ApiMessageType.INITIALIZE_SHARE_GROUP_STATE, true),
+    READ_SHARE_GROUP_STATE(ApiMessageType.READ_SHARE_GROUP_STATE, true),
+    WRITE_SHARE_GROUP_STATE(ApiMessageType.WRITE_SHARE_GROUP_STATE, true),
+    DELETE_SHARE_GROUP_STATE(ApiMessageType.DELETE_SHARE_GROUP_STATE, true),
+    READ_SHARE_GROUP_STATE_SUMMARY(ApiMessageType.READ_SHARE_GROUP_STATE_SUMMARY, true),
+    STREAMS_GROUP_HEARTBEAT(ApiMessageType.STREAMS_GROUP_HEARTBEAT),
+    STREAMS_GROUP_DESCRIBE(ApiMessageType.STREAMS_GROUP_DESCRIBE);
+    
 
     private static final Map<ApiMessageType.ListenerType, EnumSet<ApiKeys>> APIS_BY_LISTENER =
         new EnumMap<>(ApiMessageType.ListenerType.class);
@@ -135,7 +160,7 @@ public enum ApiKeys {
     /** indicates the minimum required inter broker magic required to support the API */
     public final byte minRequiredInterBrokerMagic;
 
-    /** indicates whether the API is enabled for forwarding **/
+    /** indicates whether the API is enabled for forwarding */
     public final boolean forwardable;
 
     public final boolean requiresDelayedAllocation;
@@ -172,7 +197,7 @@ public enum ApiKeys {
     private static boolean shouldRetainsBufferReference(Schema[] requestSchemas) {
         boolean requestRetainsBufferReference = false;
         for (Schema requestVersionSchema : requestSchemas) {
-            if (retainsBufferReference(requestVersionSchema)) {
+            if (requestVersionSchema != null && retainsBufferReference(requestVersionSchema)) {
                 requestRetainsBufferReference = true;
                 break;
             }
@@ -193,7 +218,11 @@ public enum ApiKeys {
     }
 
     public short latestVersion() {
-        return messageType.highestSupportedVersion();
+        return messageType.highestSupportedVersion(true);
+    }
+
+    public short latestVersion(boolean enableUnstableLastVersion) {
+        return messageType.highestSupportedVersion(enableUnstableLastVersion);
     }
 
     public short oldestVersion() {
@@ -212,6 +241,34 @@ public enum ApiKeys {
         return apiVersion >= oldestVersion() && apiVersion <= latestVersion();
     }
 
+    public boolean isVersionEnabled(short apiVersion, boolean enableUnstableLastVersion) {
+        // ApiVersions API is a particular case. The client always send the highest version
+        // that it supports and the server fails back to version 0 if it does not know it.
+        // Hence, we have to accept any versions here, even unsupported ones.
+        if (this == ApiKeys.API_VERSIONS) return true;
+
+        return apiVersion >= oldestVersion() && apiVersion <= latestVersion(enableUnstableLastVersion);
+    }
+
+    public boolean isVersionDeprecated(short apiVersion) {
+        return apiVersion >= messageType.lowestDeprecatedVersion() && apiVersion <= messageType.highestDeprecatedVersion();
+    }
+
+    public Optional<ApiVersionsResponseData.ApiVersion> toApiVersion(boolean enableUnstableLastVersion) {
+        short oldestVersion = oldestVersion();
+        short latestVersion = latestVersion(enableUnstableLastVersion);
+
+        // API is entirely disabled if latestStableVersion is smaller than oldestVersion.
+        if (latestVersion >= oldestVersion) {
+            return Optional.of(new ApiVersionsResponseData.ApiVersion()
+               .setApiKey(messageType.apiKey())
+               .setMinVersion(oldestVersion)
+               .setMaxVersion(latestVersion));
+        } else {
+            return Optional.empty();
+        }
+    }
+
     public short requestHeaderVersion(short apiVersion) {
         return messageType.requestHeaderVersion(apiVersion);
     }
@@ -224,23 +281,25 @@ public enum ApiKeys {
         return messageType.listeners().contains(listener);
     }
 
-    private static String toHtml() {
+    static String toHtml() {
         final StringBuilder b = new StringBuilder();
         b.append("<table class=\"data-table\"><tbody>\n");
         b.append("<tr>");
         b.append("<th>Name</th>\n");
         b.append("<th>Key</th>\n");
         b.append("</tr>");
-        for (ApiKeys key : zkBrokerApis()) {
-            b.append("<tr>\n");
-            b.append("<td>");
-            b.append("<a href=\"#The_Messages_" + key.name + "\">" + key.name + "</a>");
-            b.append("</td>");
-            b.append("<td>");
-            b.append(key.id);
-            b.append("</td>");
-            b.append("</tr>\n");
-        }
+        clientApis().stream()
+            .filter(apiKey -> apiKey.toApiVersion(false).isPresent())
+            .forEach(apiKey -> {
+                b.append("<tr>\n");
+                b.append("<td>");
+                b.append("<a href=\"#The_Messages_" + apiKey.name + "\">" + apiKey.name + "</a>");
+                b.append("</td>");
+                b.append("<td>");
+                b.append(apiKey.id);
+                b.append("</td>");
+                b.append("</tr>\n");
+            });
         b.append("</tbody></table>\n");
         return b.toString();
     }
@@ -267,8 +326,19 @@ public enum ApiKeys {
         return apisForListener(ApiMessageType.ListenerType.ZK_BROKER);
     }
 
+    public static EnumSet<ApiKeys> kraftBrokerApis() {
+        return apisForListener(ApiMessageType.ListenerType.BROKER);
+    }
+
     public static EnumSet<ApiKeys> controllerApis() {
         return apisForListener(ApiMessageType.ListenerType.CONTROLLER);
+    }
+
+    public static EnumSet<ApiKeys> clientApis() {
+        List<ApiKeys> apis = Arrays.stream(ApiKeys.values())
+            .filter(apiKey -> apiKey.inScope(ApiMessageType.ListenerType.ZK_BROKER) || apiKey.inScope(ApiMessageType.ListenerType.BROKER))
+            .collect(Collectors.toList());
+        return EnumSet.copyOf(apis);
     }
 
     public static EnumSet<ApiKeys> apisForListener(ApiMessageType.ListenerType listener) {
@@ -276,10 +346,9 @@ public enum ApiKeys {
     }
 
     private static EnumSet<ApiKeys> filterApisForListener(ApiMessageType.ListenerType listener) {
-        List<ApiKeys> controllerApis = Arrays.stream(ApiKeys.values())
-            .filter(apiKey -> apiKey.messageType.listeners().contains(listener))
+        List<ApiKeys> apis = Arrays.stream(ApiKeys.values())
+            .filter(apiKey -> apiKey.inScope(listener))
             .collect(Collectors.toList());
-        return EnumSet.copyOf(controllerApis);
+        return EnumSet.copyOf(apis);
     }
-
 }

@@ -16,19 +16,20 @@
  */
 package kafka.server
 
-import java.util
-import java.util.Properties
 import kafka.network.SocketServer
-import kafka.security.authorizer.AclAuthorizer
+import org.apache.kafka.common.config.internals.BrokerSecurityConfigs
+import org.apache.kafka.metadata.authorizer.StandardAuthorizer
 import org.apache.kafka.common.message.{DescribeUserScramCredentialsRequestData, DescribeUserScramCredentialsResponseData}
 import org.apache.kafka.common.message.DescribeUserScramCredentialsRequestData.UserName
-import org.apache.kafka.common.protocol.{ApiKeys, Errors}
+import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.{DescribeUserScramCredentialsRequest, DescribeUserScramCredentialsResponse}
 import org.apache.kafka.common.security.auth.{AuthenticationContext, KafkaPrincipal}
 import org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
-import org.apache.kafka.server.authorizer.{Action, AuthorizableRequestContext, AuthorizationResult}
+import org.apache.kafka.server.config.ServerConfigs
+import org.junit.jupiter.api.{BeforeEach, Test, TestInfo}
 import org.junit.jupiter.api.Assertions._
-import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 
 import scala.jdk.CollectionConverters._
 
@@ -38,15 +39,18 @@ import scala.jdk.CollectionConverters._
  * Testing the API for the case where there are actually credentials to describe is performed elsewhere.
  */
 class DescribeUserScramCredentialsRequestTest extends BaseRequestTest {
+  @BeforeEach
+  override def setUp(testInfo: TestInfo): Unit = {
+    this.serverConfig.setProperty(ServerConfigs.AUTHORIZER_CLASS_NAME_CONFIG, classOf[StandardAuthorizer].getName)
+    this.serverConfig.setProperty(BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG, classOf[AlterCredentialsTest.TestPrincipalBuilderReturningAuthorized].getName)
+    this.serverConfig.setProperty(ServerConfigs.CONTROLLED_SHUTDOWN_ENABLE_CONFIG, "false")
 
-  override def brokerPropertyOverrides(properties: Properties): Unit = {
-    properties.put(KafkaConfig.ControlledShutdownEnableProp, "false")
-    properties.put(KafkaConfig.AuthorizerClassNameProp, classOf[DescribeCredentialsTest.TestAuthorizer].getName)
-    properties.put(KafkaConfig.PrincipalBuilderClassProp, classOf[DescribeCredentialsTest.TestPrincipalBuilderReturningAuthorized].getName)
+    super.setUp(testInfo)
   }
 
-  @Test
-  def testDescribeNothing(): Unit = {
+  @ParameterizedTest
+  @ValueSource(strings = Array("kraft"))
+  def testDescribeNothing(quorum: String): Unit = {
     val request = new DescribeUserScramCredentialsRequest.Builder(
       new DescribeUserScramCredentialsRequestData()).build()
     val response = sendDescribeUserScramCredentialsRequest(request)
@@ -56,8 +60,9 @@ class DescribeUserScramCredentialsRequestTest extends BaseRequestTest {
     assertEquals(0, response.data.results.size, "Expected no credentials when describing everything and there are no credentials")
   }
 
-  @Test
-  def testDescribeWithNull(): Unit = {
+  @ParameterizedTest
+  @ValueSource(strings = Array("kraft"))
+  def testDescribeWithNull(quorum: String): Unit = {
     val request = new DescribeUserScramCredentialsRequest.Builder(
       new DescribeUserScramCredentialsRequestData().setUsers(null)).build()
     val response = sendDescribeUserScramCredentialsRequest(request)
@@ -77,8 +82,9 @@ class DescribeUserScramCredentialsRequestTest extends BaseRequestTest {
     assertEquals(Errors.NONE.code, error, "Did not expect controller error when routed to non-controller")
   }
 
-  @Test
-  def testDescribeSameUserTwice(): Unit = {
+  @ParameterizedTest
+  @ValueSource(strings = Array("kraft"))
+  def testDescribeSameUserTwice(quorum: String): Unit = {
     val user = "user1"
     val userName = new UserName().setName(user)
     val request = new DescribeUserScramCredentialsRequest.Builder(
@@ -92,8 +98,9 @@ class DescribeUserScramCredentialsRequestTest extends BaseRequestTest {
     assertEquals(s"Cannot describe SCRAM credentials for the same user twice in a single request: $user", result.errorMessage)
   }
 
-  @Test
-  def testUnknownUser(): Unit = {
+  @ParameterizedTest
+  @ValueSource(strings = Array("kraft"))
+  def testUnknownUser(quorum: String): Unit = {
     val unknownUser = "unknownUser"
     val request = new DescribeUserScramCredentialsRequest.Builder(
       new DescribeUserScramCredentialsRequestData().setUsers(List(new UserName().setName(unknownUser)).asJava)).build()
@@ -106,7 +113,7 @@ class DescribeUserScramCredentialsRequestTest extends BaseRequestTest {
     assertEquals(s"Attempt to describe a user credential that does not exist: $unknownUser", result.errorMessage)
   }
 
-  private def sendDescribeUserScramCredentialsRequest(request: DescribeUserScramCredentialsRequest, socketServer: SocketServer = controllerSocketServer): DescribeUserScramCredentialsResponse = {
+  private def sendDescribeUserScramCredentialsRequest(request: DescribeUserScramCredentialsRequest, socketServer: SocketServer = adminSocketServer): DescribeUserScramCredentialsResponse = {
     connectAndReceive[DescribeUserScramCredentialsResponse](request, destination = socketServer)
   }
 }
@@ -114,17 +121,6 @@ class DescribeUserScramCredentialsRequestTest extends BaseRequestTest {
 object DescribeCredentialsTest {
   val UnauthorizedPrincipal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Unauthorized")
   val AuthorizedPrincipal = KafkaPrincipal.ANONYMOUS
-
-  class TestAuthorizer extends AclAuthorizer {
-    override def authorize(requestContext: AuthorizableRequestContext, actions: util.List[Action]): util.List[AuthorizationResult] = {
-      actions.asScala.map { _ =>
-        if (requestContext.requestType == ApiKeys.DESCRIBE_USER_SCRAM_CREDENTIALS.id && requestContext.principal == UnauthorizedPrincipal)
-          AuthorizationResult.DENIED
-        else
-          AuthorizationResult.ALLOWED
-      }.asJava
-    }
-  }
 
   class TestPrincipalBuilderReturningAuthorized extends DefaultKafkaPrincipalBuilder(null, null) {
     override def build(context: AuthenticationContext): KafkaPrincipal = {

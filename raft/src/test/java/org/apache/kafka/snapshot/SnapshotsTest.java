@@ -19,6 +19,7 @@ package org.apache.kafka.snapshot;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.raft.OffsetAndEpoch;
 import org.apache.kafka.test.TestUtils;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -33,7 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-final public class SnapshotsTest {
+public final class SnapshotsTest {
 
     @Test
     public void testValidSnapshotFilename() {
@@ -75,7 +76,7 @@ final public class SnapshotsTest {
             TestUtils.RANDOM.nextInt(Integer.MAX_VALUE)
         );
         Path path = Snapshots.snapshotPath(TestUtils.tempDirectory().toPath(), snapshotId);
-        Path deletedPath = Snapshots.deleteRename(path, snapshotId);
+        Path deletedPath = Snapshots.deleteRenamePath(path, snapshotId);
         SnapshotPath snapshotPath = Snapshots.parse(deletedPath).get();
 
         assertEquals(snapshotId, snapshotPath.snapshotId);
@@ -108,7 +109,7 @@ final public class SnapshotsTest {
         );
 
         Path logDirPath = TestUtils.tempDirectory().toPath();
-        try (FileRawSnapshotWriter snapshot = FileRawSnapshotWriter.create(logDirPath, snapshotId, Optional.empty())) {
+        try (FileRawSnapshotWriter snapshot = FileRawSnapshotWriter.create(logDirPath, snapshotId)) {
             snapshot.freeze();
 
             Path snapshotPath = Snapshots.snapshotPath(logDirPath, snapshotId);
@@ -116,11 +117,11 @@ final public class SnapshotsTest {
 
             if (renameBeforeDeleting)
                 // rename snapshot before deleting
-                Utils.atomicMoveWithFallback(snapshotPath, Snapshots.deleteRename(snapshotPath, snapshotId), false);
+                Utils.atomicMoveWithFallback(snapshotPath, Snapshots.deleteRenamePath(snapshotPath, snapshotId), false);
 
             assertTrue(Snapshots.deleteIfExists(logDirPath, snapshot.snapshotId()));
             assertFalse(Files.exists(snapshotPath));
-            assertFalse(Files.exists(Snapshots.deleteRename(snapshotPath, snapshotId)));
+            assertFalse(Files.exists(Snapshots.deleteRenamePath(snapshotPath, snapshotId)));
         }
     }
 }

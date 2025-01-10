@@ -16,13 +16,13 @@
  */
 package org.apache.kafka.common.requests;
 
-import java.nio.ByteBuffer;
-import java.util.Map;
-
 import org.apache.kafka.common.message.ExpireDelegationTokenResponseData;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.Errors;
+
+import java.nio.ByteBuffer;
+import java.util.Map;
 
 public class ExpireDelegationTokenResponse extends AbstractResponse {
 
@@ -54,6 +54,11 @@ public class ExpireDelegationTokenResponse extends AbstractResponse {
     @Override
     public ExpireDelegationTokenResponseData data() {
         return data;
+    }
+
+    @Override
+    public void maybeSetThrottleTimeMs(int throttleTimeMs) {
+        data.setThrottleTimeMs(throttleTimeMs);
     }
 
     @Override

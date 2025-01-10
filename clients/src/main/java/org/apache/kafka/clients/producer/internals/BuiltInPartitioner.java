@@ -20,6 +20,7 @@ import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Utils;
+
 import org.slf4j.Logger;
 
 import java.util.Arrays;
@@ -27,7 +28,6 @@ import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
 
 /**
  * Built-in default partitioner.  Note, that this is just a utility class that is used directly from
@@ -44,8 +44,6 @@ public class BuiltInPartitioner {
     private volatile PartitionLoadStats partitionLoadStats = null;
     private final AtomicReference<StickyPartitionInfo> stickyPartitionInfo = new AtomicReference<>();
 
-    // Visible and used for testing only.
-    static volatile public Supplier<Integer> mockRandom = null;
 
     /**
      * BuiltInPartitioner constructor.
@@ -56,6 +54,9 @@ public class BuiltInPartitioner {
     public BuiltInPartitioner(LogContext logContext, String topic, int stickyBatchSize) {
         this.log = logContext.logger(BuiltInPartitioner.class);
         this.topic = topic;
+        if (stickyBatchSize < 1) {
+            throw new IllegalArgumentException("stickyBatchSize must be >= 1 but got " + stickyBatchSize);
+        }
         this.stickyBatchSize = stickyBatchSize;
     }
 
@@ -63,7 +64,7 @@ public class BuiltInPartitioner {
      * Calculate the next partition for the topic based on the partition load stats.
      */
     private int nextPartition(Cluster cluster) {
-        int random = mockRandom != null ? mockRandom.get() : Utils.toPositive(ThreadLocalRandom.current().nextInt());
+        int random = randomPartition();
 
         // Cache volatile variable in local variable.
         PartitionLoadStats partitionLoadStats = this.partitionLoadStats;
@@ -73,7 +74,7 @@ public class BuiltInPartitioner {
             // We don't have stats to do adaptive partitioning (or it's disabled), just switch to the next
             // partition based on uniform distribution.
             List<PartitionInfo> availablePartitions = cluster.availablePartitionsForTopic(topic);
-            if (availablePartitions.size() > 0) {
+            if (!availablePartitions.isEmpty()) {
                 partition = availablePartitions.get(random % availablePartitions.size()).partition();
             } else {
                 // We don't have available partitions, just pick one among all partitions.
@@ -108,6 +109,10 @@ public class BuiltInPartitioner {
 
         log.trace("Switching to partition {} in topic {}", partition, topic);
         return partition;
+    }
+
+    int randomPartition() {
+        return Utils.toPositive(ThreadLocalRandom.current().nextInt());
     }
 
     /**
@@ -170,13 +175,52 @@ public class BuiltInPartitioner {
      * @param cluster The cluster information
      */
     void updatePartitionInfo(StickyPartitionInfo partitionInfo, int appendedBytes, Cluster cluster) {
+        updatePartitionInfo(partitionInfo, appendedBytes, cluster, true);
+    }
+
+    /**
+     * Update partition info with the number of bytes appended and maybe switch partition.
+     * NOTE this function needs to be called under the partition's batch queue lock.
+     *
+     * @param partitionInfo The sticky partition info object returned by peekCurrentPartitionInfo
+     * @param appendedBytes The number of bytes appended to this partition
+     * @param cluster The cluster information
+     * @param enableSwitch If true, switch partition once produced enough bytes
+     */
+    void updatePartitionInfo(StickyPartitionInfo partitionInfo, int appendedBytes, Cluster cluster, boolean enableSwitch) {
         // partitionInfo may be null if the caller didn't use built-in partitioner.
         if (partitionInfo == null)
             return;
 
         assert partitionInfo == stickyPartitionInfo.get();
         int producedBytes = partitionInfo.producedBytes.addAndGet(appendedBytes);
-        if (producedBytes >= stickyBatchSize) {
+
+        // We're trying to switch partition once we produce stickyBatchSize bytes to a partition
+        // but doing so may hinder batching because partition switch may happen while batch isn't
+        // ready to send.  This situation is especially likely with high linger.ms setting.
+        // Consider the following example:
+        //   linger.ms=500, producer produces 12KB in 500ms, batch.size=16KB
+        //     - first batch collects 12KB in 500ms, gets sent
+        //     - second batch collects 4KB, then we switch partition, so 4KB gets eventually sent
+        //     - ... and so on - we'd get 12KB and 4KB batches
+        // To get more optimal batching and avoid 4KB fractional batches, the caller may disallow
+        // partition switch if batch is not ready to send, so with the example above we'd avoid
+        // fractional 4KB batches: in that case the scenario would look like this:
+        //     - first batch collects 12KB in 500ms, gets sent
+        //     - second batch collects 4KB, but partition switch doesn't happen because batch in not ready
+        //     - second batch collects 12KB in 500ms, gets sent and now we switch partition.
+        //     - ... and so on - we'd just send 12KB batches
+        // We cap the produced bytes to not exceed 2x of the batch size to avoid pathological cases
+        // (e.g. if we have a mix of keyed and unkeyed messages, key messages may create an
+        // unready batch after the batch that disabled partition switch becomes ready).
+        // As a result, with high latency.ms setting we end up switching partitions after producing
+        // between stickyBatchSize and stickyBatchSize * 2 bytes, to better align with batch boundary.
+        if (producedBytes >= stickyBatchSize * 2) {
+            log.trace("Produced {} bytes, exceeding twice the batch size of {} bytes, with switching set to {}",
+                producedBytes, stickyBatchSize, enableSwitch);
+        }
+
+        if (producedBytes >= stickyBatchSize && enableSwitch || producedBytes >= stickyBatchSize * 2) {
             // We've produced enough to this partition, switch to next.
             StickyPartitionInfo newPartitionInfo = new StickyPartitionInfo(nextPartition(cluster));
             stickyPartitionInfo.set(newPartitionInfo);
@@ -289,10 +333,11 @@ public class BuiltInPartitioner {
     /**
      * The partition load stats for each topic that are used for adaptive partition distribution.
      */
-    private final static class PartitionLoadStats {
+    private static final class PartitionLoadStats {
         public final int[] cumulativeFrequencyTable;
         public final int[] partitionIds;
         public final int length;
+
         public PartitionLoadStats(int[] cumulativeFrequencyTable, int[] partitionIds, int length) {
             assert cumulativeFrequencyTable.length == partitionIds.length;
             assert length <= cumulativeFrequencyTable.length;

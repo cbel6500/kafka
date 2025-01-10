@@ -18,9 +18,7 @@ package org.apache.kafka.common.internals;
 
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.InvalidTopicException;
-import org.apache.kafka.common.utils.Utils;
 
-import java.util.Collections;
 import java.util.Set;
 import java.util.function.Consumer;
 
@@ -28,12 +26,15 @@ public class Topic {
 
     public static final String GROUP_METADATA_TOPIC_NAME = "__consumer_offsets";
     public static final String TRANSACTION_STATE_TOPIC_NAME = "__transaction_state";
-    public static final String METADATA_TOPIC_NAME = "__cluster_metadata";
-    public static final TopicPartition METADATA_TOPIC_PARTITION = new TopicPartition(METADATA_TOPIC_NAME, 0);
+    public static final String SHARE_GROUP_STATE_TOPIC_NAME = "__share_group_state";
+    public static final String CLUSTER_METADATA_TOPIC_NAME = "__cluster_metadata";
+    public static final TopicPartition CLUSTER_METADATA_TOPIC_PARTITION = new TopicPartition(
+        CLUSTER_METADATA_TOPIC_NAME,
+        0
+    );
     public static final String LEGAL_CHARS = "[a-zA-Z0-9._-]";
 
-    private static final Set<String> INTERNAL_TOPICS = Collections.unmodifiableSet(
-            Utils.mkSet(GROUP_METADATA_TOPIC_NAME, TRANSACTION_STATE_TOPIC_NAME));
+    private static final Set<String> INTERNAL_TOPICS = Set.of(GROUP_METADATA_TOPIC_NAME, TRANSACTION_STATE_TOPIC_NAME, SHARE_GROUP_STATE_TOPIC_NAME);
 
     private static final int MAX_NAME_LENGTH = 249;
 
@@ -43,17 +44,31 @@ public class Topic {
         });
     }
 
-    public static void validate(String name, String logPrefix, Consumer<String> throwableConsumer) {
+    private static String detectInvalidTopic(String name) {
         if (name.isEmpty())
-            throwableConsumer.accept(logPrefix + " is illegal, it can't be empty");
-        if (".".equals(name) || "..".equals(name))
-            throwableConsumer.accept(logPrefix + " cannot be \".\" or \"..\"");
+            return "the empty string is not allowed";
+        if (".".equals(name))
+            return "'.' is not allowed";
+        if ("..".equals(name))
+            return "'..' is not allowed";
         if (name.length() > MAX_NAME_LENGTH)
-            throwableConsumer.accept(logPrefix + " is illegal, it can't be longer than " + MAX_NAME_LENGTH +
-                    " characters, " + logPrefix + ": " + name);
+            return "the length of '" + name + "' is longer than the max allowed length " + MAX_NAME_LENGTH;
         if (!containsValidPattern(name))
-            throwableConsumer.accept(logPrefix + " \"" + name + "\" is illegal, it contains a character other than " +
-                    "ASCII alphanumerics, '.', '_' and '-'");
+            return "'" + name + "' contains one or more characters other than " +
+                "ASCII alphanumerics, '.', '_' and '-'";
+        return null;
+    }
+
+    public static boolean isValid(String name) {
+        String reasonInvalid = detectInvalidTopic(name);
+        return reasonInvalid == null;
+    }
+
+    public static void validate(String name, String logPrefix, Consumer<String> throwableConsumer) {
+        String reasonInvalid = detectInvalidTopic(name);
+        if (reasonInvalid != null) {
+            throwableConsumer.accept(logPrefix + " is invalid: " +  reasonInvalid);
+        }
     }
 
     public static boolean isInternal(String topic) {

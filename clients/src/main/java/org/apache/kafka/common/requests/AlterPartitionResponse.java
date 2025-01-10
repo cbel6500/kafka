@@ -44,15 +44,20 @@ public class AlterPartitionResponse extends AbstractResponse {
     public Map<Errors, Integer> errorCounts() {
         Map<Errors, Integer> counts = new HashMap<>();
         updateErrorCounts(counts, Errors.forCode(data.errorCode()));
-        data.topics().forEach(topicResponse -> topicResponse.partitions().forEach(partitionResponse -> {
-            updateErrorCounts(counts, Errors.forCode(partitionResponse.errorCode()));
-        }));
+        data.topics().forEach(topicResponse -> topicResponse.partitions().forEach(partitionResponse ->
+            updateErrorCounts(counts, Errors.forCode(partitionResponse.errorCode()))
+        ));
         return counts;
     }
 
     @Override
     public int throttleTimeMs() {
         return data.throttleTimeMs();
+    }
+
+    @Override
+    public void maybeSetThrottleTimeMs(int throttleTimeMs) {
+        data.setThrottleTimeMs(throttleTimeMs);
     }
 
     public static AlterPartitionResponse parse(ByteBuffer buffer, short version) {

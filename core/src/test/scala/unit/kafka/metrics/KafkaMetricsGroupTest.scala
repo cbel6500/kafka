@@ -17,19 +17,20 @@
 
 package kafka.metrics
 
+import org.apache.kafka.server.metrics.KafkaMetricsGroup
+
 import org.junit.jupiter.api.Assertions.{assertEquals, assertNull}
 import org.junit.jupiter.api.Test
+
+import java.util.Collections
+import scala.jdk.CollectionConverters._
 
 class KafkaMetricsGroupTest {
 
   @Test
   def testUntaggedMetricName(): Unit = {
-    val metricName = KafkaMetricsGroup.explicitMetricName(
-      group = "kafka.metrics",
-      typeName = "TestMetrics",
-      name = "TaggedMetric",
-      Map.empty
-    )
+    val metricsGroup = new KafkaMetricsGroup("kafka.metrics", "TestMetrics")
+    val metricName = metricsGroup.metricName("TaggedMetric", Collections.emptyMap())
 
     assertEquals("kafka.metrics", metricName.getGroup)
     assertEquals("TestMetrics", metricName.getType)
@@ -41,13 +42,9 @@ class KafkaMetricsGroupTest {
 
   @Test
   def testTaggedMetricName(): Unit = {
-    val tags = Map("foo" -> "bar", "bar" -> "baz", "baz" -> "raz.taz")
-    val metricName = KafkaMetricsGroup.explicitMetricName(
-      group = "kafka.metrics",
-      typeName = "TestMetrics",
-      name = "TaggedMetric",
-      tags
-    )
+    val tags = Map("foo" -> "bar", "bar" -> "baz", "baz" -> "raz.taz").asJava
+    val metricsGroup = new KafkaMetricsGroup("kafka.metrics", "TestMetrics")
+    val metricName = metricsGroup.metricName("TaggedMetric", tags)
 
     assertEquals("kafka.metrics", metricName.getGroup)
     assertEquals("TestMetrics", metricName.getType)
@@ -59,13 +56,9 @@ class KafkaMetricsGroupTest {
 
   @Test
   def testTaggedMetricNameWithEmptyValue(): Unit = {
-    val tags = Map("foo" -> "bar", "bar" -> "", "baz" -> "raz.taz")
-    val metricName = KafkaMetricsGroup.explicitMetricName(
-      group = "kafka.metrics",
-      typeName = "TestMetrics",
-      name = "TaggedMetric",
-      tags
-    )
+    val tags = Map("foo" -> "bar", "bar" -> "", "baz" -> "raz.taz").asJava
+    val metricsGroup = new KafkaMetricsGroup("kafka.metrics", "TestMetrics")
+    val metricName = metricsGroup.metricName("TaggedMetric", tags)
 
     assertEquals("kafka.metrics", metricName.getGroup)
     assertEquals("TestMetrics", metricName.getType)

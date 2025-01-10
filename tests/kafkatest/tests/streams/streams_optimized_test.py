@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ducktape.mark import matrix
 from ducktape.mark.resource import cluster
 from ducktape.tests.test import Test
 from ducktape.utils.util import wait_until
-from kafkatest.services.kafka import KafkaService
+from kafkatest.services.kafka import KafkaService, quorum
 from kafkatest.services.streams import StreamsOptimizedUpgradeTestService
 from kafkatest.services.streams import StreamsResetter
 from kafkatest.services.verifiable_producer import VerifiableProducer
-from kafkatest.services.zookeeper import ZookeeperService
 from kafkatest.tests.streams.utils import stop_processors
 
 class StreamsOptimizedTest(Test):
@@ -45,9 +45,8 @@ class StreamsOptimizedTest(Test):
             self.join_topic: {'partitions': 6}
         }
 
-        self.zookeeper = ZookeeperService(self.test_context, num_nodes=1)
-        self.kafka = KafkaService(self.test_context, num_nodes=3,
-                                  zk=self.zookeeper, topics=self.topics)
+        self.kafka = KafkaService(self.test_context, num_nodes=3, controller_num_nodes_override=1,
+                                  zk=None, topics=self.topics)
 
         self.producer = VerifiableProducer(self.test_context,
                                            1,
@@ -57,8 +56,8 @@ class StreamsOptimizedTest(Test):
                                            acks=1)
 
     @cluster(num_nodes=9)
-    def test_upgrade_optimized_topology(self):
-        self.zookeeper.start()
+    @matrix(metadata_quorum=[quorum.combined_kraft])
+    def test_upgrade_optimized_topology(self, metadata_quorum):
         self.kafka.start()
 
         processor1 = StreamsOptimizedUpgradeTestService(self.test_context, self.kafka)
@@ -104,7 +103,6 @@ class StreamsOptimizedTest(Test):
         self.logger.info("teardown")
         self.producer.stop()
         self.kafka.stop()
-        self.zookeeper.stop()
 
     def reset_application(self):
         resetter = StreamsResetter(self.test_context, self.kafka, topic = self.input_topic, applicationId = 'StreamsOptimizedTest')

@@ -18,60 +18,59 @@
 package org.apache.kafka.streams.kstream.internals.graph;
 
 import org.apache.kafka.streams.processor.internals.InternalTopologyBuilder;
-import org.apache.kafka.streams.state.StoreBuilder;
-import org.apache.kafka.streams.state.TimestampedKeyValueStore;
+import org.apache.kafka.streams.processor.internals.StoreFactory;
 
 import java.util.Arrays;
-import java.util.Objects;
 
 public class TableProcessorNode<K, V> extends GraphNode {
 
     private final ProcessorParameters<K, V, ?, ?> processorParameters;
-    private final StoreBuilder<TimestampedKeyValueStore<K, V>> storeBuilder;
+    private final StoreFactory storeFactory;
     private final String[] storeNames;
 
     public TableProcessorNode(final String nodeName,
-                              final ProcessorParameters<K, V, ?, ?> processorParameters,
-                              final StoreBuilder<TimestampedKeyValueStore<K, V>> storeBuilder) {
-        this(nodeName, processorParameters, storeBuilder, null);
+                              final ProcessorParameters<K, V, ?, ?> processorParameters) {
+        this(nodeName, processorParameters, null, null);
     }
 
     public TableProcessorNode(final String nodeName,
                               final ProcessorParameters<K, V, ?, ?> processorParameters,
-                              // TODO KIP-300: we are enforcing this as a keyvalue store, but it should go beyond any type of stores
-                              final StoreBuilder<TimestampedKeyValueStore<K, V>> storeBuilder,
+                              final StoreFactory storeFactory,
                               final String[] storeNames) {
         super(nodeName);
         this.processorParameters = processorParameters;
-        this.storeBuilder = storeBuilder;
+        this.storeFactory = storeFactory;
         this.storeNames = storeNames != null ? storeNames : new String[] {};
+    }
+
+    public ProcessorParameters<K, V, ?, ?> processorParameters() {
+        return processorParameters;
     }
 
     @Override
     public String toString() {
         return "TableProcessorNode{" +
             ", processorParameters=" + processorParameters +
-            ", storeBuilder=" + (storeBuilder == null ? "null" : storeBuilder.name()) +
+            ", storeFactory=" + (storeFactory == null ? "null" : storeFactory.storeName()) +
             ", storeNames=" + Arrays.toString(storeNames) +
             "} " + super.toString();
     }
 
+    @SuppressWarnings("unchecked")
     @Override
     public void writeToTopology(final InternalTopologyBuilder topologyBuilder) {
+        processorParameters.addProcessorTo(topologyBuilder, parentNodeNames());
+
         final String processorName = processorParameters.processorName();
-        topologyBuilder.addProcessor(processorName, processorParameters.processorSupplier(), parentNodeNames());
 
         if (storeNames.length > 0) {
+            // todo(rodesai): remove me once all operators have been moved to ProcessorSupplier
             topologyBuilder.connectProcessorAndStateStores(processorName, storeNames);
         }
 
-        if (processorParameters.kTableSourceSupplier() != null) {
-            if (processorParameters.kTableSourceSupplier().materialized()) {
-                topologyBuilder.addStateStore(Objects.requireNonNull(storeBuilder, "storeBuilder was null"),
-                                              processorName);
-            }
-        } else if (storeBuilder != null) {
-            topologyBuilder.addStateStore(storeBuilder, processorName);
+        if (storeFactory != null) {
+            // todo(rodesai) remove when KTableImpl#doFilter, KTableImpl#doTransformValues moved to ProcessorSupplier
+            topologyBuilder.addStateStore(storeFactory, processorName);
         }
     }
 }

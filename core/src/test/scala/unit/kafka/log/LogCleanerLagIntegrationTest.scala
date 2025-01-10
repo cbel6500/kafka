@@ -19,7 +19,9 @@ package kafka.log
 
 import kafka.utils._
 import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.record.CompressionType
+import org.apache.kafka.server.util.MockTime
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.{Arguments, MethodSource}
@@ -44,9 +46,10 @@ class LogCleanerLagIntegrationTest extends AbstractLogCleanerIntegrationTest wit
 
   @ParameterizedTest
   @MethodSource(Array("parameters"))
-  def cleanerTest(codec: CompressionType): Unit = {
+  def cleanerTest(compressionType: CompressionType): Unit = {
+    val codec: Compression = Compression.of(compressionType).build()
     cleaner = makeCleaner(partitions = topicPartitions,
-      backOffMs = cleanerBackOffMs,
+      backoffMs = cleanerBackOffMs,
       minCompactionLagMs = minCompactionLag,
       segmentSize = segmentSize)
     val log = cleaner.logs.get(topicPartitions(0))
@@ -94,14 +97,14 @@ class LogCleanerLagIntegrationTest extends AbstractLogCleanerIntegrationTest wit
   }
 
   private def readFromLog(log: UnifiedLog): Iterable[(Int, Int)] = {
-    for (segment <- log.logSegments; record <- segment.log.records.asScala) yield {
+    for (segment <- log.logSegments.asScala; record <- segment.log.records.asScala) yield {
       val key = TestUtils.readString(record.key).toInt
       val value = TestUtils.readString(record.value).toInt
       key -> value
     }
   }
 
-  private def writeDups(numKeys: Int, numDups: Int, log: UnifiedLog, codec: CompressionType, timestamp: Long): Seq[(Int, Int)] = {
+  private def writeDups(numKeys: Int, numDups: Int, log: UnifiedLog, codec: Compression, timestamp: Long): Seq[(Int, Int)] = {
     for (_ <- 0 until numDups; key <- 0 until numKeys) yield {
       val count = counter
       log.appendAsLeader(TestUtils.singletonRecords(value = counter.toString.getBytes, codec = codec,

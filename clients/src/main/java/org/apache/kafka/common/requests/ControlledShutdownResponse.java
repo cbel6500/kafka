@@ -58,6 +58,11 @@ public class ControlledShutdownResponse extends AbstractResponse {
         return DEFAULT_THROTTLE_TIME;
     }
 
+    @Override
+    public void maybeSetThrottleTimeMs(int throttleTimeMs) {
+        // Not supported by the response schema
+    }
+
     public static ControlledShutdownResponse parse(ByteBuffer buffer, short version) {
         return new ControlledShutdownResponse(new ControlledShutdownResponseData(new ByteBufferAccessor(buffer), version));
     }
@@ -71,11 +76,11 @@ public class ControlledShutdownResponse extends AbstractResponse {
         ControlledShutdownResponseData data = new ControlledShutdownResponseData();
         data.setErrorCode(error.code());
         ControlledShutdownResponseData.RemainingPartitionCollection pSet = new ControlledShutdownResponseData.RemainingPartitionCollection();
-        tps.forEach(tp -> {
+        tps.forEach(tp ->
             pSet.add(new RemainingPartition()
                     .setTopicName(tp.topic())
-                    .setPartitionIndex(tp.partition()));
-        });
+                    .setPartitionIndex(tp.partition()))
+        );
         data.setRemainingPartitions(pSet);
         return new ControlledShutdownResponse(data);
     }

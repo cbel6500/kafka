@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.connect.runtime;
 
+import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.metrics.stats.Avg;
@@ -23,20 +24,22 @@ import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
 import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroupId;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNotSame;
-import static org.junit.Assert.assertSame;
-import static org.junit.Assert.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ConnectMetricsTest {
 
@@ -49,12 +52,12 @@ public class ConnectMetricsTest {
 
     private ConnectMetrics metrics;
 
-    @Before
+    @BeforeEach
     public void setUp() {
         metrics = new ConnectMetrics("worker1", new WorkerConfig(WorkerConfig.baseConfigDef(), DEFAULT_WORKER_CONFIG), new MockTime(), "cluster-1");
     }
 
-    @After
+    @AfterEach
     public void tearDown() {
         if (metrics != null)
             metrics.stop();
@@ -143,6 +146,29 @@ public class ConnectMetricsTest {
         final Sensor recreatedSensor = addToGroup(metrics, false);
         // since we didn't close the group, the second addToGroup is idempotent
         assertSame(originalSensor, recreatedSensor);
+    }
+
+    @Test
+    public void testMetricReporters() {
+        assertEquals(1, metrics.metrics().reporters().size());
+    }
+
+    @Test
+    public void testDisableJmxReporter() {
+        Map<String, String> props = new HashMap<>(DEFAULT_WORKER_CONFIG);
+        props.put(CommonClientConfigs.METRIC_REPORTER_CLASSES_CONFIG, "");
+        ConnectMetrics cm = new ConnectMetrics("worker-testDisableJmxReporter", new WorkerConfig(WorkerConfig.baseConfigDef(), props), new MockTime(), "cluster-1");
+        assertTrue(cm.metrics().reporters().isEmpty());
+        cm.stop();
+    }
+
+    @Test
+    public void testExplicitlyEnableJmxReporter() {
+        Map<String, String> props = new HashMap<>(DEFAULT_WORKER_CONFIG);
+        props.put(CommonClientConfigs.METRIC_REPORTER_CLASSES_CONFIG, "org.apache.kafka.common.metrics.JmxReporter");
+        ConnectMetrics cm = new ConnectMetrics("worker-testExplicitlyEnableJmxReporter", new WorkerConfig(WorkerConfig.baseConfigDef(), props), new MockTime(), "cluster-1");
+        assertEquals(1, cm.metrics().reporters().size());
+        cm.stop();
     }
 
     private Sensor addToGroup(ConnectMetrics connectMetrics, boolean shouldClose) {

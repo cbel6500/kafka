@@ -27,7 +27,7 @@
   //
   // Version 5 removes TopicName and replaces it with TopicId and reorganizes
   // the partitions by topic, as described by KIP-516.
-  "validVersions": "0-6",
+  "validVersions": "0-7",
   "flexibleVersions": "4+",
   "fields": [
     { "name": "ErrorCode", "type": "int16", "versions": "0+",
@@ -35,9 +35,9 @@
     { "name": "PartitionErrors", "type": "[]LeaderAndIsrPartitionError", "versions": "0-4",
       "about": "Each partition in v0 to v4 message."},
     { "name":  "Topics", "type": "[]LeaderAndIsrTopicError", "versions": "5+",
-      "about": "Each topic", "fields": [
+      "about": "Each topic.", "fields": [
       { "name": "TopicId", "type": "uuid", "versions": "5+", "mapKey": true,
-        "about": "The unique topic ID" },
+        "about": "The unique topic ID." },
       { "name": "PartitionErrors", "type": "[]LeaderAndIsrPartitionError", "versions": "5+",
         "about": "Each partition."}
       ]}

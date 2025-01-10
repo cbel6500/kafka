@@ -17,16 +17,15 @@
 package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.streams.processor.TaskId;
+
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.CompletableFuture;
+
 import static org.apache.kafka.streams.processor.internals.TaskAndAction.Action.ADD;
-import static org.apache.kafka.streams.processor.internals.TaskAndAction.Action.PAUSE;
 import static org.apache.kafka.streams.processor.internals.TaskAndAction.Action.REMOVE;
-import static org.apache.kafka.streams.processor.internals.TaskAndAction.Action.RESUME;
 import static org.apache.kafka.streams.processor.internals.TaskAndAction.createAddTask;
-import static org.apache.kafka.streams.processor.internals.TaskAndAction.createPauseTask;
 import static org.apache.kafka.streams.processor.internals.TaskAndAction.createRemoveTask;
-import static org.apache.kafka.streams.processor.internals.TaskAndAction.createResumeTask;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -40,46 +39,26 @@ class TaskAndActionTest {
 
         final TaskAndAction addTask = createAddTask(task);
 
-        assertEquals(ADD, addTask.getAction());
-        assertEquals(task, addTask.getTask());
-        final Exception exception = assertThrows(IllegalStateException.class, addTask::getTaskId);
-        assertEquals("Action type ADD cannot have a task ID!", exception.getMessage());
+        assertEquals(ADD, addTask.action());
+        assertEquals(task, addTask.task());
+        final Exception exceptionForTaskId = assertThrows(IllegalStateException.class, addTask::taskId);
+        assertEquals("Action type ADD cannot have a task ID!", exceptionForTaskId.getMessage());
+        final Exception exceptionForFutureForRemove = assertThrows(IllegalStateException.class, addTask::futureForRemove);
+        assertEquals("Action type ADD cannot have a future with a single result!", exceptionForFutureForRemove.getMessage());
     }
 
     @Test
     public void shouldCreateRemoveTaskAction() {
         final TaskId taskId = new TaskId(0, 0);
+        final CompletableFuture<StateUpdater.RemovedTaskResult> future = new CompletableFuture<>();
 
-        final TaskAndAction removeTask = createRemoveTask(taskId);
+        final TaskAndAction removeTask = createRemoveTask(taskId, future);
 
-        assertEquals(REMOVE, removeTask.getAction());
-        assertEquals(taskId, removeTask.getTaskId());
-        final Exception exception = assertThrows(IllegalStateException.class, removeTask::getTask);
-        assertEquals("Action type REMOVE cannot have a task!", exception.getMessage());
-    }
-
-    @Test
-    public void shouldCreatePauseTaskAction() {
-        final TaskId taskId = new TaskId(0, 0);
-
-        final TaskAndAction pauseTask = createPauseTask(taskId);
-
-        assertEquals(PAUSE, pauseTask.getAction());
-        assertEquals(taskId, pauseTask.getTaskId());
-        final Exception exception = assertThrows(IllegalStateException.class, pauseTask::getTask);
-        assertEquals("Action type PAUSE cannot have a task!", exception.getMessage());
-    }
-
-    @Test
-    public void shouldCreateResumeTaskAction() {
-        final TaskId taskId = new TaskId(0, 0);
-
-        final TaskAndAction pauseTask = createResumeTask(taskId);
-
-        assertEquals(RESUME, pauseTask.getAction());
-        assertEquals(taskId, pauseTask.getTaskId());
-        final Exception exception = assertThrows(IllegalStateException.class, pauseTask::getTask);
-        assertEquals("Action type RESUME cannot have a task!", exception.getMessage());
+        assertEquals(REMOVE, removeTask.action());
+        assertEquals(taskId, removeTask.taskId());
+        assertEquals(future, removeTask.futureForRemove());
+        final Exception exceptionForTask = assertThrows(IllegalStateException.class, removeTask::task);
+        assertEquals("Action type REMOVE cannot have a task!", exceptionForTask.getMessage());
     }
 
     @Test
@@ -90,19 +69,19 @@ class TaskAndActionTest {
 
     @Test
     public void shouldThrowIfRemoveTaskActionIsCreatedWithNullTaskId() {
-        final Exception exception = assertThrows(NullPointerException.class, () -> createRemoveTask(null));
+        final Exception exception = assertThrows(
+            NullPointerException.class,
+            () -> createRemoveTask(null, new CompletableFuture<>())
+        );
         assertTrue(exception.getMessage().contains("Task ID of task to remove is null!"));
     }
 
     @Test
-    public void shouldThrowIfPauseTaskActionIsCreatedWithNullTaskId() {
-        final Exception exception = assertThrows(NullPointerException.class, () -> createPauseTask(null));
-        assertTrue(exception.getMessage().contains("Task ID of task to pause is null!"));
-    }
-
-    @Test
-    public void shouldThrowIfResumeTaskActionIsCreatedWithNullTaskId() {
-        final Exception exception = assertThrows(NullPointerException.class, () -> createResumeTask(null));
-        assertTrue(exception.getMessage().contains("Task ID of task to resume is null!"));
+    public void shouldThrowIfRemoveTaskActionIsCreatedWithNullFuture() {
+        final Exception exception = assertThrows(
+            NullPointerException.class,
+            () -> createRemoveTask(new TaskId(0, 0), null)
+        );
+        assertTrue(exception.getMessage().contains("Future for task to remove is null!"));
     }
 }

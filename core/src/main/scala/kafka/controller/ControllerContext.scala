@@ -18,8 +18,8 @@
 package kafka.controller
 
 import kafka.cluster.Broker
-import kafka.utils.Implicits._
 import org.apache.kafka.common.{TopicPartition, Uuid}
+import org.apache.kafka.metadata.LeaderAndIsr
 
 import scala.collection.{Map, Seq, Set, mutable}
 
@@ -72,7 +72,7 @@ case class ReplicaAssignment private (replicas: Seq[Int],
     s"removingReplicas=${removingReplicas.mkString(",")})"
 }
 
-class ControllerContext {
+class ControllerContext extends ControllerChannelContext {
   val stats = new ControllerStats
   var offlinePartitionCount = 0
   var preferredReplicaImbalanceCount = 0
@@ -215,6 +215,10 @@ class ControllerContext {
 
   // getter
   def liveBrokerIds: Set[Int] = liveBrokerEpochs.keySet.diff(shuttingDownBrokerIds)
+  // To just check if a broker is live, we should use this method instead of liveBrokerIds.contains(brokerId)
+  // which is more expensive because it constructs the set of live broker IDs.
+  // See KAFKA-17061 for the details.
+  def isLiveBroker(brokerId: Int): Boolean = liveBrokerEpochs.contains(brokerId) && !shuttingDownBrokerIds(brokerId)
   def liveOrShuttingDownBrokerIds: Set[Int] = liveBrokerEpochs.keySet
   def liveOrShuttingDownBrokers: Set[Broker] = liveBrokers
   def liveBrokerIdAndEpochs: Map[Int, Long] = liveBrokerEpochs
@@ -230,10 +234,14 @@ class ControllerContext {
     }.toSet
   }
 
-  def isReplicaOnline(brokerId: Int, topicPartition: TopicPartition, includeShuttingDownBrokers: Boolean = false): Boolean = {
+  def isReplicaOnline(brokerId: Int, topicPartition: TopicPartition): Boolean = {
+    isReplicaOnline(brokerId, topicPartition, includeShuttingDownBrokers = false)
+  }
+
+  def isReplicaOnline(brokerId: Int, topicPartition: TopicPartition, includeShuttingDownBrokers: Boolean): Boolean = {
     val brokerOnline = {
       if (includeShuttingDownBrokers) liveOrShuttingDownBrokerIds.contains(brokerId)
-      else liveBrokerIds.contains(brokerId)
+      else isLiveBroker(brokerId)
     }
     brokerOnline && !replicasOnOfflineDirs.getOrElse(brokerId, Set.empty).contains(topicPartition)
   }
@@ -445,6 +453,18 @@ class ControllerContext {
       Some(replicaAssignment), Some(leaderIsrAndControllerEpoch))
   }
 
+  def leaderEpoch(partition: TopicPartition): Int = {
+    // A sentinel (-2) is used as an epoch if the topic is queued for deletion. It overrides
+    // any existing epoch.
+    if (isTopicQueuedUpForDeletion(partition.topic)) {
+      LeaderAndIsr.EPOCH_DURING_DELETE
+    } else {
+      partitionLeadershipInfo.get(partition)
+        .map(_.leaderAndIsr.leaderEpoch)
+        .getOrElse(LeaderAndIsr.NO_EPOCH)
+    }
+  }
+
   def partitionLeadershipInfo(partition: TopicPartition): Option[LeaderIsrAndControllerEpoch] = {
     partitionLeadershipInfo.get(partition)
   }
@@ -501,7 +521,7 @@ class ControllerContext {
   }
 
   private def cleanPreferredReplicaImbalanceMetric(topic: String): Unit = {
-    partitionAssignments.getOrElse(topic, mutable.Map.empty).forKeyValue { (partition, replicaAssignment) =>
+    partitionAssignments.getOrElse(topic, mutable.Map.empty).foreachEntry { (partition, replicaAssignment) =>
       partitionLeadershipInfo.get(new TopicPartition(topic, partition)).foreach { leadershipInfo =>
         if (!hasPreferredLeader(replicaAssignment, leadershipInfo))
           preferredReplicaImbalanceCount -= 1
@@ -524,5 +544,4 @@ class ControllerContext {
 
   private def isValidPartitionStateTransition(partition: TopicPartition, targetState: PartitionState): Boolean =
     targetState.validPreviousStates.contains(partitionStates(partition))
-
 }
