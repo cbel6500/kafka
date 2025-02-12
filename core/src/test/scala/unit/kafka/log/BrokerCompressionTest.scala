@@ -17,25 +17,30 @@
 
 package kafka.log
 
-import kafka.message._
-import kafka.server.{BrokerTopicStats, FetchLogEnd, LogDirFailureChannel}
 import kafka.utils._
+import org.apache.kafka.common.compress.Compression
+import org.apache.kafka.common.config.TopicConfig
 import org.apache.kafka.common.record.{CompressionType, MemoryRecords, RecordBatch, SimpleRecord}
 import org.apache.kafka.common.utils.Utils
+import org.apache.kafka.coordinator.transaction.TransactionLogConfig
+import org.apache.kafka.server.record.BrokerCompressionType
+import org.apache.kafka.server.storage.log.FetchIsolation
+import org.apache.kafka.server.util.MockTime
+import org.apache.kafka.storage.internals.log.{LogConfig, LogDirFailureChannel, ProducerStateManagerConfig}
+import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api._
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.{Arguments, MethodSource}
 
 import java.util.Properties
-import scala.jdk.CollectionConverters._
 
 class BrokerCompressionTest {
 
   val tmpDir = TestUtils.tempDir()
   val logDir = TestUtils.randomPartitionLogDir(tmpDir)
   val time = new MockTime(0, 0)
-  val logConfig = LogConfig()
+  val logConfig = new LogConfig(new Properties)
 
   @AfterEach
   def tearDown(): Unit = {
@@ -47,53 +52,54 @@ class BrokerCompressionTest {
    */
   @ParameterizedTest
   @MethodSource(Array("parameters"))
-  def testBrokerSideCompression(messageCompression: String, brokerCompression: String): Unit = {
-    val messageCompressionCode = CompressionCodec.getCompressionCodec(messageCompression)
+  def testBrokerSideCompression(messageCompressionType: CompressionType, brokerCompressionType: BrokerCompressionType): Unit = {
+    val messageCompression = Compression.of(messageCompressionType).build()
     val logProps = new Properties()
-    logProps.put(LogConfig.CompressionTypeProp, brokerCompression)
+    logProps.put(TopicConfig.COMPRESSION_TYPE_CONFIG, brokerCompressionType.name)
     /*configure broker-side compression  */
     val log = UnifiedLog(
       dir = logDir,
-      config = LogConfig(logProps),
+      config = new LogConfig(logProps),
       logStartOffset = 0L,
       recoveryPoint = 0L,
       scheduler = time.scheduler,
       time = time,
       brokerTopicStats = new BrokerTopicStats,
       maxTransactionTimeoutMs = 5 * 60 * 1000,
-      maxProducerIdExpirationMs = 60 * 60 * 1000,
-      producerIdExpirationCheckIntervalMs = LogManager.ProducerIdExpirationCheckIntervalMs,
+      producerStateManagerConfig = new ProducerStateManagerConfig(TransactionLogConfig.PRODUCER_ID_EXPIRATION_MS_DEFAULT, false),
+      producerIdExpirationCheckIntervalMs = TransactionLogConfig.PRODUCER_ID_EXPIRATION_CHECK_INTERVAL_MS_DEFAULT,
       logDirFailureChannel = new LogDirFailureChannel(10),
-      topicId = None,
-      keepPartitionMetadataFile = true
+      topicId = None
     )
 
     /* append two messages */
-    log.appendAsLeader(MemoryRecords.withRecords(CompressionType.forId(messageCompressionCode.codec), 0,
+    log.appendAsLeader(MemoryRecords.withRecords(messageCompression, 0,
           new SimpleRecord("hello".getBytes), new SimpleRecord("there".getBytes)), leaderEpoch = 0)
 
     def readBatch(offset: Int): RecordBatch = {
       val fetchInfo = log.read(offset,
         maxLength = 4096,
-        isolation = FetchLogEnd,
+        isolation = FetchIsolation.LOG_END,
         minOneMessage = true)
       fetchInfo.records.batches.iterator.next()
     }
 
-    if (!brokerCompression.equals("producer")) {
-      val brokerCompressionCode = BrokerCompressionCodec.getCompressionCodec(brokerCompression)
-      assertEquals(brokerCompressionCode.codec, readBatch(0).compressionType.id, "Compression at offset 0 should produce " + brokerCompressionCode.name)
+    if (brokerCompressionType != BrokerCompressionType.PRODUCER) {
+      val targetCompression = BrokerCompressionType.targetCompression(log.config.compression, null)
+      assertEquals(targetCompression.`type`(), readBatch(0).compressionType, "Compression at offset 0 should produce " + brokerCompressionType)
     }
     else
-      assertEquals(messageCompressionCode.codec, readBatch(0).compressionType.id, "Compression at offset 0 should produce " + messageCompressionCode.name)
+      assertEquals(messageCompressionType, readBatch(0).compressionType, "Compression at offset 0 should produce " + messageCompressionType)
   }
 
 }
 
 object BrokerCompressionTest {
   def parameters: java.util.stream.Stream[Arguments] = {
-    (for (brokerCompression <- BrokerCompressionCodec.brokerCompressionOptions;
-         messageCompression <- CompressionType.values
-    ) yield Arguments.of(messageCompression.name, brokerCompression)).asJava.stream()
+    java.util.Arrays.stream(
+      for (brokerCompression <- BrokerCompressionType.values;
+           messageCompression <- CompressionType.values
+      ) yield Arguments.of(messageCompression, brokerCompression)
+    )
   }
 }

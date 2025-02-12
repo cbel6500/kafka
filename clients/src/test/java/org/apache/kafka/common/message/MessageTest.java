@@ -17,13 +17,12 @@
 
 package org.apache.kafka.common.message;
 
-import com.fasterxml.jackson.databind.JsonNode;
-
 import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.AddPartitionsToTxnTopic;
 import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.AddPartitionsToTxnTopicCollection;
+import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.AddPartitionsToTxnTransactionCollection;
 import org.apache.kafka.common.message.DescribeClusterResponseData.DescribeClusterBroker;
 import org.apache.kafka.common.message.DescribeClusterResponseData.DescribeClusterBrokerCollection;
 import org.apache.kafka.common.message.DescribeGroupsResponseData.DescribedGroup;
@@ -57,6 +56,9 @@ import org.apache.kafka.common.protocol.Message;
 import org.apache.kafka.common.protocol.MessageUtil;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
 import org.apache.kafka.common.protocol.types.RawTaggedField;
+
+import com.fasterxml.jackson.databind.JsonNode;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -80,7 +82,7 @@ public final class MessageTest {
 
     private final String memberId = "memberId";
     private final String instanceId = "instanceId";
-    private final List<Integer> listOfVersionsNonBatchOffsetFetch = Arrays.asList(0, 1, 2, 3, 4, 5, 6, 7);
+    private final List<Integer> listOfVersionsNonBatchOffsetFetch = Arrays.asList(1, 2, 3, 4, 5, 6, 7);
 
     @Test
     public void testAddOffsetsToTxnVersions() throws Exception {
@@ -96,14 +98,26 @@ public final class MessageTest {
 
     @Test
     public void testAddPartitionsToTxnVersions() throws Exception {
-        testAllMessageRoundTrips(new AddPartitionsToTxnRequestData().
-                setTransactionalId("blah").
-                setProducerId(0xbadcafebadcafeL).
-                setProducerEpoch((short) 30000).
-                setTopics(new AddPartitionsToTxnTopicCollection(singletonList(
+        AddPartitionsToTxnRequestData v3AndBelowData = new AddPartitionsToTxnRequestData().
+                setV3AndBelowTransactionalId("blah").
+                setV3AndBelowProducerId(0xbadcafebadcafeL).
+                setV3AndBelowProducerEpoch((short) 30000).
+                setV3AndBelowTopics(new AddPartitionsToTxnTopicCollection(singletonList(
                         new AddPartitionsToTxnTopic().
                                 setName("Topic").
-                                setPartitions(singletonList(1))).iterator())));
+                                setPartitions(singletonList(1))).iterator()));
+        testDuplication(v3AndBelowData);
+        testAllMessageRoundTripsUntilVersion((short) 3, v3AndBelowData);
+
+        AddPartitionsToTxnRequestData data = new AddPartitionsToTxnRequestData().
+                setTransactions(new AddPartitionsToTxnTransactionCollection(singletonList(
+                       new AddPartitionsToTxnRequestData.AddPartitionsToTxnTransaction().
+                              setTransactionalId("blah").
+                              setProducerId(0xbadcafebadcafeL).
+                              setProducerEpoch((short) 30000).
+                              setTopics(v3AndBelowData.v3AndBelowTopics())).iterator()));
+        testDuplication(data);
+        testAllMessageRoundTripsFromVersion((short) 4, data);
     }
 
     @Test
@@ -185,21 +199,17 @@ public final class MessageTest {
     public void testListOffsetsResponseVersions() throws Exception {
         ListOffsetsPartitionResponse partition = new ListOffsetsPartitionResponse()
                 .setErrorCode(Errors.NONE.code())
-                .setPartitionIndex(0)
-                .setOldStyleOffsets(Collections.singletonList(321L));
+                .setPartitionIndex(0);
         List<ListOffsetsTopicResponse> topics = Collections.singletonList(new ListOffsetsTopicResponse()
                 .setName("topic")
                 .setPartitions(Collections.singletonList(partition)));
         Supplier<ListOffsetsResponseData> response = () -> new ListOffsetsResponseData()
                 .setTopics(topics);
-        for (short version : ApiKeys.LIST_OFFSETS.allVersions()) {
+        for (short version = ApiKeys.LIST_OFFSETS.oldestVersion(); version <= ApiKeys.LIST_OFFSETS.latestVersion(); ++version) {
             ListOffsetsResponseData responseData = response.get();
-            if (version > 0) {
-                responseData.topics().get(0).partitions().get(0)
-                    .setOldStyleOffsets(Collections.emptyList())
-                    .setOffset(456L)
-                    .setTimestamp(123L);
-            }
+            responseData.topics().get(0).partitions().get(0)
+                .setOffset(456L)
+                .setTimestamp(123L);
             if (version > 1) {
                 responseData.setThrottleTimeMs(1000);
             }
@@ -263,7 +273,7 @@ public final class MessageTest {
                 .setGroupId("groupId")
                 .setMemberId(memberId)
                 .setTopics(new ArrayList<>())
-                .setGenerationId(15);
+                .setGenerationIdOrMemberEpoch(15);
         testAllMessageRoundTripsFromVersion((short) 1, request.get());
         testAllMessageRoundTripsFromVersion((short) 1, request.get().setGroupInstanceId(null));
         testAllMessageRoundTripsFromVersion((short) 7, request.get().setGroupInstanceId(instanceId));
@@ -385,7 +395,8 @@ public final class MessageTest {
                 .setPartitions(singletonList(partitionDataNoCurrentEpoch)));
 
         testAllMessageRoundTrips(data);
-        testAllMessageRoundTripsBeforeVersion((short) 2, partitionDataWithCurrentEpoch, partitionDataNoCurrentEpoch);
+        short lowestVersion = ApiKeys.OFFSET_FOR_LEADER_EPOCH.oldestVersion();
+        testAllMessageRoundTripsBetweenVersions(lowestVersion, (short) 2, partitionDataWithCurrentEpoch, partitionDataNoCurrentEpoch);
         testAllMessageRoundTripsFromVersion((short) 2, partitionDataWithCurrentEpoch);
 
         // Version 3 adds the optional replica Id field
@@ -396,35 +407,6 @@ public final class MessageTest {
         testAllMessageRoundTripsBeforeVersion((short) 3,
                 new OffsetForLeaderEpochRequestData().setReplicaId(5),
                 new OffsetForLeaderEpochRequestData().setReplicaId(-2));
-    }
-
-    @Test
-    public void testLeaderAndIsrVersions() throws Exception {
-        // Version 3 adds two new fields - AddingReplicas and RemovingReplicas
-        LeaderAndIsrRequestData.LeaderAndIsrTopicState partitionStateNoAddingRemovingReplicas =
-            new LeaderAndIsrRequestData.LeaderAndIsrTopicState()
-                .setTopicName("topic")
-                .setPartitionStates(Collections.singletonList(
-                    new LeaderAndIsrRequestData.LeaderAndIsrPartitionState()
-                        .setPartitionIndex(0)
-                        .setReplicas(Collections.singletonList(0))
-                ));
-        LeaderAndIsrRequestData.LeaderAndIsrTopicState partitionStateWithAddingRemovingReplicas =
-            new LeaderAndIsrRequestData.LeaderAndIsrTopicState()
-                .setTopicName("topic")
-                .setPartitionStates(Collections.singletonList(
-                    new LeaderAndIsrRequestData.LeaderAndIsrPartitionState()
-                        .setPartitionIndex(0)
-                        .setReplicas(Collections.singletonList(0))
-                        .setAddingReplicas(Collections.singletonList(1))
-                        .setRemovingReplicas(Collections.singletonList(1))
-                ));
-        testAllMessageRoundTripsBetweenVersions(
-            (short) 2,
-            (short) 3,
-            new LeaderAndIsrRequestData().setTopicStates(Collections.singletonList(partitionStateWithAddingRemovingReplicas)),
-            new LeaderAndIsrRequestData().setTopicStates(Collections.singletonList(partitionStateNoAddingRemovingReplicas)));
-        testAllMessageRoundTripsFromVersion((short) 3, new LeaderAndIsrRequestData().setTopicStates(Collections.singletonList(partitionStateWithAddingRemovingReplicas)));
     }
 
     @Test
@@ -461,22 +443,13 @@ public final class MessageTest {
                                       .setCommittedLeaderEpoch(10)
                                       .setCommittedMetadata(metadata)
                                       .setCommittedOffset(offset)
-                                      .setCommitTimestamp(20)
                             ))))
                     .setRetentionTimeMs(20);
 
         for (short version : ApiKeys.OFFSET_COMMIT.allVersions()) {
             OffsetCommitRequestData requestData = request.get();
-            if (version < 1) {
-                requestData.setMemberId("");
-                requestData.setGenerationId(-1);
-            }
 
-            if (version != 1) {
-                requestData.topics().get(0).partitions().get(0).setCommitTimestamp(-1);
-            }
-
-            if (version < 2 || version > 4) {
+            if (version > 4) {
                 requestData.setRetentionTimeMs(-1);
             }
 
@@ -488,9 +461,7 @@ public final class MessageTest {
                 requestData.setGroupInstanceId(null);
             }
 
-            if (version == 1) {
-                testEquivalentMessageRoundTrip(version, requestData);
-            } else if (version >= 2 && version <= 4) {
+            if (version >= 2 && version <= 4) {
                 testAllMessageRoundTripsBetweenVersions(version, (short) 5, requestData, requestData);
             } else {
                 testAllMessageRoundTripsFromVersion(version, requestData);
@@ -613,7 +584,7 @@ public final class MessageTest {
     }
 
     @Test
-    public void testOffsetFetchV0ToV7() throws Exception {
+    public void testOffsetFetchV1ToV7() throws Exception {
         String groupId = "groupId";
         String topicName = "topic";
 
@@ -641,15 +612,15 @@ public final class MessageTest {
         for (int version : listOfVersionsNonBatchOffsetFetch) {
             final short finalVersion = (short) version;
             if (version < 2) {
-                assertThrows(NullPointerException.class, () -> testAllMessageRoundTripsOffsetFetchFromVersionV0ToV7(finalVersion, allPartitionData));
+                assertThrows(NullPointerException.class, () -> testAllMessageRoundTripsOffsetFetchFromVersionToV7(finalVersion, allPartitionData));
             } else {
-                testAllMessageRoundTripsOffsetFetchFromVersionV0ToV7((short) version, allPartitionData);
+                testAllMessageRoundTripsOffsetFetchFromVersionToV7((short) version, allPartitionData);
             }
 
             if (version < 7) {
-                assertThrows(UnsupportedVersionException.class, () -> testAllMessageRoundTripsOffsetFetchFromVersionV0ToV7(finalVersion, requireStableData));
+                assertThrows(UnsupportedVersionException.class, () -> testAllMessageRoundTripsOffsetFetchFromVersionToV7(finalVersion, requireStableData));
             } else {
-                testAllMessageRoundTripsOffsetFetchFromVersionV0ToV7(finalVersion, requireStableData);
+                testAllMessageRoundTripsOffsetFetchFromVersionToV7(finalVersion, requireStableData);
             }
         }
 
@@ -681,17 +652,17 @@ public final class MessageTest {
                 responseData.topics().get(0).partitions().get(0).setCommittedLeaderEpoch(-1);
             }
 
-            testAllMessageRoundTripsOffsetFetchFromVersionV0ToV7((short) version, responseData);
+            testAllMessageRoundTripsOffsetFetchFromVersionToV7((short) version, responseData);
         }
     }
 
     private void testAllMessageRoundTripsOffsetFetchV0ToV7(Message message) throws Exception {
         testDuplication(message);
-        testAllMessageRoundTripsOffsetFetchFromVersionV0ToV7(message.lowestSupportedVersion(), message);
+        testAllMessageRoundTripsOffsetFetchFromVersionToV7(message.lowestSupportedVersion(), message);
     }
 
-    private void testAllMessageRoundTripsOffsetFetchFromVersionV0ToV7(short fromVersion,
-        Message message) throws Exception {
+    private void testAllMessageRoundTripsOffsetFetchFromVersionToV7(short fromVersion,
+                                                                    Message message) throws Exception {
         for (short version = fromVersion; version <= 7; version++) {
             testEquivalentMessageRoundTrip(version, message);
         }
@@ -1032,6 +1003,12 @@ public final class MessageTest {
         }
     }
 
+    private void testAllMessageRoundTripsUntilVersion(short untilVersion, Message message) throws Exception {
+        for (short version = message.lowestSupportedVersion(); version <= untilVersion; version++) {
+            testEquivalentMessageRoundTrip(version, message);
+        }
+    }
+
     private void testMessageRoundTrip(short version, Message message, Message expected) throws Exception {
         testByteBufferRoundTrip(version, message, expected);
     }
@@ -1089,37 +1066,40 @@ public final class MessageTest {
     @Test
     public void testMessageVersions() {
         for (ApiKeys apiKey : ApiKeys.values()) {
-            Message message = null;
-            try {
-                message = ApiMessageType.fromApiKey(apiKey.id).newRequest();
-            } catch (UnsupportedVersionException e) {
-                fail("No request message spec found for API " + apiKey);
+            if (apiKey.hasValidVersion()) {
+                Message message = null;
+                try {
+                    message = ApiMessageType.fromApiKey(apiKey.id).newRequest();
+                } catch (UnsupportedVersionException e) {
+                    fail("No request message spec found for API " + apiKey);
+                }
+                assertTrue(apiKey.latestVersion() <= message.highestSupportedVersion(),
+                        "Request message spec for " + apiKey + " only " + "supports versions up to " +
+                                message.highestSupportedVersion());
+                try {
+                    message = ApiMessageType.fromApiKey(apiKey.id).newResponse();
+                } catch (UnsupportedVersionException e) {
+                    fail("No response message spec found for API " + apiKey);
+                }
+                assertTrue(apiKey.latestVersion() <= message.highestSupportedVersion(),
+                        "Response message spec for " + apiKey + " only " + "supports versions up to " +
+                                message.highestSupportedVersion());
             }
-            assertTrue(apiKey.latestVersion() <= message.highestSupportedVersion(),
-                "Request message spec for " + apiKey + " only " + "supports versions up to " +
-                message.highestSupportedVersion());
-            try {
-                message = ApiMessageType.fromApiKey(apiKey.id).newResponse();
-            } catch (UnsupportedVersionException e) {
-                fail("No response message spec found for API " + apiKey);
-            }
-            assertTrue(apiKey.latestVersion() <= message.highestSupportedVersion(),
-                "Response message spec for " + apiKey + " only " + "supports versions up to " +
-                message.highestSupportedVersion());
         }
     }
 
     @Test
     public void testDefaultValues() {
-        verifyWriteRaisesUve((short) 0, "validateOnly",
-            new CreateTopicsRequestData().setValidateOnly(true));
-        verifyWriteSucceeds((short) 0,
-            new CreateTopicsRequestData().setValidateOnly(false));
-        verifyWriteSucceeds((short) 0,
+        verifyWriteSucceeds((short) 2,
             new OffsetCommitRequestData().setRetentionTimeMs(123));
+
         verifyWriteRaisesUve((short) 5, "forgotten",
             new FetchRequestData().setForgottenTopicsData(singletonList(
                 new FetchRequestData.ForgottenTopic().setTopic("foo"))));
+        verifyWriteSucceeds((short) 5, new FetchRequestData());
+        verifyWriteSucceeds((short) 7,
+                new FetchRequestData().setForgottenTopicsData(singletonList(
+                        new FetchRequestData.ForgottenTopic().setTopic("foo"))));
     }
 
     @Test
@@ -1162,7 +1142,7 @@ public final class MessageTest {
     }
 
     @Test
-    public void testLongTaggedString() throws Exception {
+    public void testLongTaggedString() {
         char[] chars = new char[1024];
         Arrays.fill(chars, 'a');
         String longString = new String(chars);

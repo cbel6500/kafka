@@ -61,6 +61,12 @@ import static java.util.Collections.emptyMap;
 import static org.apache.kafka.common.utils.Utils.mkEntry;
 
 public class SmokeTestDriver extends SmokeTestUtil {
+    /**
+     * We are creating all records two days in the past, so that we can flush all windows by sending a final record
+     * using the current timestamp, without using timestamps in the future.
+     */
+    private static final long CREATE_TIME_SHIFT_MS = Duration.ofDays(2).toMillis();
+
     private static final String[] NUMERIC_VALUE_TOPICS = {
         "data",
         "echo",
@@ -137,11 +143,23 @@ public class SmokeTestDriver extends SmokeTestUtil {
                 final ProducerRecord<byte[], byte[]> record =
                     new ProducerRecord<>(
                         "data",
+                        null,
+                        System.currentTimeMillis() - CREATE_TIME_SHIFT_MS,
                         stringSerde.serializer().serialize("", key),
                         intSerde.serializer().serialize("", value)
                     );
 
                 producer.send(record);
+
+                final ProducerRecord<byte[], byte[]> fkRecord =
+                    new ProducerRecord<>(
+                        "fk",
+                        null,
+                        System.currentTimeMillis() - CREATE_TIME_SHIFT_MS,
+                        intSerde.serializer().serialize("", value),
+                        stringSerde.serializer().serialize("", key)
+                    );
+                producer.send(fkRecord);
 
                 numRecordsProduced++;
                 if (numRecordsProduced % 100 == 0) {
@@ -190,6 +208,8 @@ public class SmokeTestDriver extends SmokeTestUtil {
                     final ProducerRecord<byte[], byte[]> record =
                         new ProducerRecord<>(
                             "data",
+                            null,
+                            System.currentTimeMillis() - CREATE_TIME_SHIFT_MS,
                             stringSerde.serializer().serialize("", key),
                             intSerde.serializer().serialize("", value)
                         );
@@ -199,6 +219,8 @@ public class SmokeTestDriver extends SmokeTestUtil {
                     final ProducerRecord<byte[], byte[]> fkRecord =
                         new ProducerRecord<>(
                             "fk",
+                            null,
+                            System.currentTimeMillis() - CREATE_TIME_SHIFT_MS,
                             intSerde.serializer().serialize("", value),
                             stringSerde.serializer().serialize("", key)
                         );
@@ -264,7 +286,7 @@ public class SmokeTestDriver extends SmokeTestUtil {
             producer.send(new ProducerRecord<>(
                 partition.topic(),
                 partition.partition(),
-                System.currentTimeMillis() + Duration.ofDays(2).toMillis(),
+                System.currentTimeMillis(),
                 keyBytes,
                 valBytes
             ));
@@ -412,6 +434,7 @@ public class SmokeTestDriver extends SmokeTestUtil {
             }
         }
         consumer.close();
+
         final long finished = System.currentTimeMillis() - start;
         System.out.println("Verification time=" + finished);
         System.out.println("-------------------");
@@ -426,19 +449,9 @@ public class SmokeTestDriver extends SmokeTestUtil {
             System.out.println("PROCESSED-LESS-THAN-GENERATED");
         }
 
-        boolean success;
+        final Map<String, Set<Number>> received = parseRecordsForEchoTopic(events);
 
-        final Map<String, Set<Number>> received =
-            events.get("echo")
-                  .entrySet()
-                  .stream()
-                  .map(entry -> mkEntry(
-                      entry.getKey(),
-                      entry.getValue().stream().map(ConsumerRecord::value).collect(Collectors.toSet()))
-                  )
-                  .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
-
-        success = inputs.equals(received);
+        boolean success = inputs.equals(received);
 
         if (success) {
             System.out.println("ALL-RECORDS-DELIVERED");
@@ -460,6 +473,19 @@ public class SmokeTestDriver extends SmokeTestUtil {
 
         System.out.println(success ? "SUCCESS" : "FAILURE");
         return verificationResult;
+    }
+
+    private static Map<String, Set<Number>> parseRecordsForEchoTopic(
+        final Map<String, Map<String, LinkedList<ConsumerRecord<String, Number>>>> events) {
+        return events.containsKey("echo") ?
+            events.get("echo")
+                .entrySet()
+                .stream()
+                .map(entry -> mkEntry(
+                    entry.getKey(),
+                    entry.getValue().stream().map(ConsumerRecord::value).collect(Collectors.toSet()))
+                )
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)) : Collections.emptyMap();
     }
 
     public static class VerificationResult {
@@ -540,7 +566,7 @@ public class SmokeTestDriver extends SmokeTestUtil {
                             indent("\t\t", events.getOrDefault("cnt", emptyMap()).getOrDefault(key, new LinkedList<>())),
                             indent("\t\t", events.getOrDefault("tagg", emptyMap()).getOrDefault(key, new LinkedList<>())));
 
-                        if (!Utils.mkSet("echo", "max", "min", "dif", "cnt", "tagg").contains(topic))
+                        if (!Set.of("echo", "max", "min", "dif", "cnt", "tagg").contains(topic))
                             resultStream.printf("%sEvents=%n%s%n", topic, indent("\t\t", entry.getValue()));
                     }
 

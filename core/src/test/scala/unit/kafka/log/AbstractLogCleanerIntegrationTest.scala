@@ -19,12 +19,17 @@ package kafka.log
 import java.io.File
 import java.nio.file.Files
 import java.util.Properties
-import kafka.server.{BrokerTopicStats, LogDirFailureChannel}
-import kafka.utils.{MockTime, Pool, TestUtils}
+import kafka.utils.{Pool, TestUtils}
 import kafka.utils.Implicits._
 import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.record.{CompressionType, MemoryRecords, RecordBatch}
+import org.apache.kafka.common.compress.Compression
+import org.apache.kafka.common.config.TopicConfig
+import org.apache.kafka.common.record.{MemoryRecords, RecordBatch, RecordVersion}
 import org.apache.kafka.common.utils.Utils
+import org.apache.kafka.coordinator.transaction.TransactionLogConfig
+import org.apache.kafka.server.util.MockTime
+import org.apache.kafka.storage.internals.log.{CleanerConfig, LogConfig, LogDirFailureChannel, ProducerStateManagerConfig}
+import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.{AfterEach, Tag}
 
 import scala.collection.Seq
@@ -64,15 +69,14 @@ abstract class AbstractLogCleanerIntegrationTest {
                           segmentSize: Int = defaultSegmentSize,
                           maxCompactionLagMs: Long = defaultMaxCompactionLagMs): Properties = {
     val props = new Properties()
-    props.put(LogConfig.MaxMessageBytesProp, maxMessageSize: java.lang.Integer)
-    props.put(LogConfig.SegmentBytesProp, segmentSize: java.lang.Integer)
-    props.put(LogConfig.SegmentIndexBytesProp, 100*1024: java.lang.Integer)
-    props.put(LogConfig.FileDeleteDelayMsProp, deleteDelay: java.lang.Integer)
-    props.put(LogConfig.CleanupPolicyProp, LogConfig.Compact)
-    props.put(LogConfig.MinCleanableDirtyRatioProp, minCleanableDirtyRatio: java.lang.Float)
-    props.put(LogConfig.MessageTimestampDifferenceMaxMsProp, Long.MaxValue.toString)
-    props.put(LogConfig.MinCompactionLagMsProp, minCompactionLagMs: java.lang.Long)
-    props.put(LogConfig.MaxCompactionLagMsProp, maxCompactionLagMs: java.lang.Long)
+    props.put(TopicConfig.MAX_MESSAGE_BYTES_CONFIG, maxMessageSize: java.lang.Integer)
+    props.put(TopicConfig.SEGMENT_BYTES_CONFIG, segmentSize: java.lang.Integer)
+    props.put(TopicConfig.SEGMENT_INDEX_BYTES_CONFIG, 100*1024: java.lang.Integer)
+    props.put(TopicConfig.FILE_DELETE_DELAY_MS_CONFIG, deleteDelay: java.lang.Integer)
+    props.put(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT)
+    props.put(TopicConfig.MIN_CLEANABLE_DIRTY_RATIO_CONFIG, minCleanableDirtyRatio: java.lang.Float)
+    props.put(TopicConfig.MIN_COMPACTION_LAG_MS_CONFIG, minCompactionLagMs: java.lang.Long)
+    props.put(TopicConfig.MAX_COMPACTION_LAG_MS_CONFIG, maxCompactionLagMs: java.lang.Long)
     props ++= propertyOverrides
     props
   }
@@ -80,7 +84,7 @@ abstract class AbstractLogCleanerIntegrationTest {
   def makeCleaner(partitions: Iterable[TopicPartition],
                   minCleanableDirtyRatio: Float = defaultMinCleanableDirtyRatio,
                   numThreads: Int = 1,
-                  backOffMs: Long = 15000L,
+                  backoffMs: Long = 15000L,
                   maxMessageSize: Int = defaultMaxMessageSize,
                   minCompactionLagMs: Long = defaultMinCompactionLagMS,
                   deleteDelay: Int = defaultDeleteDelay,
@@ -94,7 +98,7 @@ abstract class AbstractLogCleanerIntegrationTest {
       val dir = new File(logDir, s"${partition.topic}-${partition.partition}")
       Files.createDirectories(dir.toPath)
 
-      val logConfig = LogConfig(logConfigProperties(propertyOverrides,
+      val logConfig = new LogConfig(logConfigProperties(propertyOverrides,
         maxMessageSize = maxMessageSize,
         minCleanableDirtyRatio = minCleanableDirtyRatio,
         minCompactionLagMs = minCompactionLagMs,
@@ -110,20 +114,23 @@ abstract class AbstractLogCleanerIntegrationTest {
         time = time,
         brokerTopicStats = new BrokerTopicStats,
         maxTransactionTimeoutMs = 5 * 60 * 1000,
-        maxProducerIdExpirationMs = 60 * 60 * 1000,
-        producerIdExpirationCheckIntervalMs = LogManager.ProducerIdExpirationCheckIntervalMs,
+        producerStateManagerConfig = new ProducerStateManagerConfig(TransactionLogConfig.PRODUCER_ID_EXPIRATION_MS_DEFAULT, false),
+        producerIdExpirationCheckIntervalMs = TransactionLogConfig.PRODUCER_ID_EXPIRATION_CHECK_INTERVAL_MS_DEFAULT,
         logDirFailureChannel = new LogDirFailureChannel(10),
-        topicId = None,
-        keepPartitionMetadataFile = true)
+        topicId = None)
       logMap.put(partition, log)
       this.logs += log
     }
 
-    val cleanerConfig = CleanerConfig(
-      numThreads = numThreads,
-      ioBufferSize = cleanerIoBufferSize.getOrElse(maxMessageSize / 2),
-      maxMessageSize = maxMessageSize,
-      backOffMs = backOffMs)
+    val cleanerConfig = new CleanerConfig(
+      numThreads,
+      4 * 1024 * 1024L,
+      0.9,
+      cleanerIoBufferSize.getOrElse(maxMessageSize / 2),
+      maxMessageSize,
+      Double.MaxValue,
+      backoffMs,
+      true)
     new LogCleaner(cleanerConfig,
       logDirs = Array(logDir),
       logs = logMap,
@@ -135,20 +142,20 @@ abstract class AbstractLogCleanerIntegrationTest {
   def counter: Int = ctr
   def incCounter(): Unit = ctr += 1
 
-  def writeDups(numKeys: Int, numDups: Int, log: UnifiedLog, codec: CompressionType,
+  def writeDups(numKeys: Int, numDups: Int, log: UnifiedLog, codec: Compression,
                 startKey: Int = 0, magicValue: Byte = RecordBatch.CURRENT_MAGIC_VALUE): Seq[(Int, String, Long)] = {
-    for(_ <- 0 until numDups; key <- startKey until (startKey + numKeys)) yield {
+    for (_ <- 0 until numDups; key <- startKey until (startKey + numKeys)) yield {
       val value = counter.toString
-      val appendInfo = log.appendAsLeader(TestUtils.singletonRecords(value = value.getBytes, codec = codec,
-        key = key.toString.getBytes, magicValue = magicValue), leaderEpoch = 0)
+      val appendInfo = log.appendAsLeaderWithRecordVersion(TestUtils.singletonRecords(value = value.getBytes, codec = codec,
+        key = key.toString.getBytes, magicValue = magicValue), leaderEpoch = 0, recordVersion = RecordVersion.lookup(magicValue))
       // move LSO forward to increase compaction bound
       log.updateHighWatermark(log.logEndOffset)
       incCounter()
-      (key, value, appendInfo.firstOffset.get.messageOffset)
+      (key, value, appendInfo.firstOffset)
     }
   }
 
-  def createLargeSingleMessageSet(key: Int, messageFormatVersion: Byte, codec: CompressionType): (String, MemoryRecords) = {
+  def createLargeSingleMessageSet(key: Int, messageFormatVersion: Byte, codec: Compression): (String, MemoryRecords) = {
     def messageValue(length: Int): String = {
       val random = new Random(0)
       new String(random.alphanumeric.take(length).toArray)
@@ -157,5 +164,10 @@ abstract class AbstractLogCleanerIntegrationTest {
     val messageSet = TestUtils.singletonRecords(value = value.getBytes, codec = codec, key = key.toString.getBytes,
       magicValue = messageFormatVersion)
     (value, messageSet)
+  }
+
+  def closeLog(log: UnifiedLog): Unit = {
+    log.close()
+    logs -= log
   }
 }

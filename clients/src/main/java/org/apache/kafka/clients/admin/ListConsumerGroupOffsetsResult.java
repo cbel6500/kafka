@@ -17,17 +17,17 @@
 
 package org.apache.kafka.clients.admin;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.concurrent.ExecutionException;
-import java.util.stream.Collectors;
-
 import org.apache.kafka.clients.admin.internals.CoordinatorKey;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.annotation.InterfaceStability;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
 
 /**
  * The result of the {@link Admin#listConsumerGroupOffsets(Map)} and
@@ -69,7 +69,7 @@ public class ListConsumerGroupOffsetsResult {
     }
 
     /**
-     * Return a future which yields all Map<String, Map<TopicPartition, OffsetAndMetadata> objects,
+     * Return a future which yields all {@code Map<String, Map<TopicPartition, OffsetAndMetadata>} objects,
      * if requests for all the groups succeed.
      */
     public KafkaFuture<Map<String, Map<TopicPartition, OffsetAndMetadata>>> all() {

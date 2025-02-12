@@ -96,6 +96,7 @@ public final class FeaturesDelta {
         } else {
             metadataVersion = metadataVersionChange;
         }
+
         return new FeaturesImage(newFinalizedVersions, metadataVersion);
     }
 

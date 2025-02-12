@@ -21,8 +21,7 @@ import org.apache.kafka.common.errors.UnsupportedVersionException;
 import java.util.Arrays;
 import java.util.Objects;
 
-
-public class SubscriptionWrapper<K> {
+public class SubscriptionWrapper<KLeft> {
     static final byte VERSION_0 = 0;
     static final byte VERSION_1 = 1;
 
@@ -32,7 +31,7 @@ public class SubscriptionWrapper<K> {
     private final long[] hash;
     private final Instruction instruction;
     private final byte version;
-    private final K primaryKey;
+    private final KLeft primaryKey;
     // v1 fields:
     private final Integer primaryPartition;
 
@@ -57,7 +56,7 @@ public class SubscriptionWrapper<K> {
             this.value = value;
         }
 
-        public byte getValue() {
+        public byte value() {
             return value;
         }
 
@@ -71,11 +70,11 @@ public class SubscriptionWrapper<K> {
         }
     }
 
-    public SubscriptionWrapper(final long[] hash, final Instruction instruction, final K primaryKey, final Integer primaryPartition) {
+    public SubscriptionWrapper(final long[] hash, final Instruction instruction, final KLeft primaryKey, final Integer primaryPartition) {
         this(hash, instruction, primaryKey, CURRENT_VERSION, primaryPartition);
     }
 
-    public SubscriptionWrapper(final long[] hash, final Instruction instruction, final K primaryKey, final byte version, final Integer primaryPartition) {
+    public SubscriptionWrapper(final long[] hash, final Instruction instruction, final KLeft primaryKey, final byte version, final Integer primaryPartition) {
         Objects.requireNonNull(instruction, "instruction cannot be null. Required by downstream processor.");
         Objects.requireNonNull(primaryKey, "primaryKey cannot be null. Required by downstream processor.");
         if (version < 0 || version > CURRENT_VERSION) {
@@ -89,23 +88,23 @@ public class SubscriptionWrapper<K> {
         this.primaryPartition = primaryPartition;
     }
 
-    public Instruction getInstruction() {
+    public Instruction instruction() {
         return instruction;
     }
 
-    public long[] getHash() {
+    public long[] hash() {
         return hash;
     }
 
-    public K getPrimaryKey() {
+    public KLeft primaryKey() {
         return primaryKey;
     }
 
-    public byte getVersion() {
+    public byte version() {
         return version;
     }
 
-    public Integer getPrimaryPartition() {
+    public Integer primaryPartition() {
         return primaryPartition;
     }
 
@@ -119,5 +118,25 @@ public class SubscriptionWrapper<K> {
             ", primaryPartition=" + primaryPartition +
             '}';
     }
-}
 
+    @Override
+    public boolean equals(final Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        final SubscriptionWrapper<?> that = (SubscriptionWrapper<?>) o;
+        return version == that.version && Arrays.equals(hash, that.hash)
+            && instruction == that.instruction && Objects.equals(primaryKey, that.primaryKey)
+            && Objects.equals(primaryPartition, that.primaryPartition);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = Objects.hash(instruction, version, primaryKey, primaryPartition);
+        result = 31 * result + Arrays.hashCode(hash);
+        return result;
+    }
+}

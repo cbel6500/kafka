@@ -16,13 +16,18 @@
  */
 package org.apache.kafka.snapshot;
 
-import org.apache.kafka.raft.OffsetAndEpoch;
+import org.apache.kafka.common.utils.BufferSupplier;
 import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.raft.KafkaRaftClient;
+import org.apache.kafka.raft.OffsetAndEpoch;
+import org.apache.kafka.raft.internals.IdentitySerde;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.NumberFormat;
@@ -32,13 +37,15 @@ public final class Snapshots {
     private static final Logger log = LoggerFactory.getLogger(Snapshots.class);
     public static final String SUFFIX = ".checkpoint";
     private static final String PARTIAL_SUFFIX = String.format("%s.part", SUFFIX);
-    private static final String DELETE_SUFFIX = String.format("%s.deleted", SUFFIX);
+    public static final String DELETE_SUFFIX = String.format("%s.deleted", SUFFIX);
 
     private static final NumberFormat OFFSET_FORMATTER = NumberFormat.getInstance();
     private static final NumberFormat EPOCH_FORMATTER = NumberFormat.getInstance();
 
     private static final int OFFSET_WIDTH = 20;
     private static final int EPOCH_WIDTH = 10;
+
+    public static final OffsetAndEpoch BOOTSTRAP_SNAPSHOT_ID = new OffsetAndEpoch(0, 0);
 
     static {
         OFFSET_FORMATTER.setMinimumIntegerDigits(OFFSET_WIDTH);
@@ -52,15 +59,15 @@ public final class Snapshots {
         return logDir;
     }
 
-    static String filenameFromSnapshotId(OffsetAndEpoch snapshotId) {
-        return String.format("%s-%s", OFFSET_FORMATTER.format(snapshotId.offset), EPOCH_FORMATTER.format(snapshotId.epoch));
+    public static String filenameFromSnapshotId(OffsetAndEpoch snapshotId) {
+        return String.format("%s-%s", OFFSET_FORMATTER.format(snapshotId.offset()), EPOCH_FORMATTER.format(snapshotId.epoch()));
     }
 
     static Path moveRename(Path source, OffsetAndEpoch snapshotId) {
         return source.resolveSibling(filenameFromSnapshotId(snapshotId) + SUFFIX);
     }
 
-    static Path deleteRename(Path source, OffsetAndEpoch snapshotId) {
+    static Path deleteRenamePath(Path source, OffsetAndEpoch snapshotId) {
         return source.resolveSibling(filenameFromSnapshotId(snapshotId) + DELETE_SUFFIX);
     }
 
@@ -72,7 +79,7 @@ public final class Snapshots {
         Path dir = snapshotDir(logDir);
 
         try {
-            // Create the snapshot directory if it doesn't exists
+            // Create the snapshot directory if it doesn't exist
             Files.createDirectories(dir);
             String prefix = String.format("%s-", filenameFromSnapshotId(snapshotId));
             return Files.createTempFile(dir, prefix, PARTIAL_SUFFIX);
@@ -114,7 +121,7 @@ public final class Snapshots {
      */
     public static boolean deleteIfExists(Path logDir, OffsetAndEpoch snapshotId) {
         Path immutablePath = snapshotPath(logDir, snapshotId);
-        Path deletedPath = deleteRename(immutablePath, snapshotId);
+        Path deletedPath = deleteRenamePath(immutablePath, snapshotId);
         try {
             boolean deleted = Files.deleteIfExists(immutablePath) | Files.deleteIfExists(deletedPath);
             if (deleted) {
@@ -130,13 +137,16 @@ public final class Snapshots {
     }
 
     /**
-     * Mark a snapshot for deletion by renaming with the deleted suffix
+     * Mark a snapshot for deletion by renaming with the deleted suffix.
+     *
+     * @return the path of the snapshot marked for deletion (i.e. with .delete suffix)
      */
-    public static void markForDelete(Path logDir, OffsetAndEpoch snapshotId) {
+    public static Path markForDelete(Path logDir, OffsetAndEpoch snapshotId) {
         Path immutablePath = snapshotPath(logDir, snapshotId);
-        Path deletedPath = deleteRename(immutablePath, snapshotId);
+        Path deletedPath = deleteRenamePath(immutablePath, snapshotId);
         try {
             Utils.atomicMoveWithFallback(immutablePath, deletedPath, false);
+            return deletedPath;
         } catch (IOException e) {
             throw new UncheckedIOException(
                 String.format(
@@ -146,6 +156,26 @@ public final class Snapshots {
                 ),
                 e
             );
+        }
+    }
+
+    public static long lastContainedLogTimestamp(RawSnapshotReader reader) {
+        try (RecordsSnapshotReader<ByteBuffer> recordsSnapshotReader =
+             RecordsSnapshotReader.of(
+                 reader,
+                 IdentitySerde.INSTANCE,
+                 new BufferSupplier.GrowableBufferSupplier(),
+                 KafkaRaftClient.MAX_BATCH_SIZE_BYTES,
+                 true
+             )
+        ) {
+            return recordsSnapshotReader.lastContainedLogTimestamp();
+        }
+    }
+
+    public static long lastContainedLogTimestamp(Path logDir, OffsetAndEpoch snapshotId) {
+        try (FileRawSnapshotReader reader = FileRawSnapshotReader.open(logDir, snapshotId)) {
+            return lastContainedLogTimestamp(reader);
         }
     }
 }

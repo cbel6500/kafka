@@ -20,8 +20,11 @@ import org.apache.kafka.common.config.internals.BrokerSecurityConfigs
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.security.auth._
 import org.apache.kafka.common.security.authenticator.DefaultKafkaPrincipalBuilder
-import org.junit.jupiter.api.{BeforeEach, Test, TestInfo}
+import org.apache.kafka.clients.admin.AdminClientConfig
+import org.junit.jupiter.api.{BeforeEach, TestInfo}
 import org.junit.jupiter.api.Assertions._
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import org.apache.kafka.common.errors.TopicAuthorizationException
 
 // This test case uses a separate listener for client and inter-broker communication, from
@@ -72,12 +75,22 @@ class PlaintextEndToEndAuthorizationTest extends EndToEndAuthorizationTest {
 
   @BeforeEach
   override def setUp(testInfo: TestInfo): Unit = {
-    startSasl(jaasSections(List.empty, None, ZkSasl))
+    startSasl(jaasSections(List.empty, None))
     super.setUp(testInfo)
   }
 
-  @Test
-  def testListenerName(): Unit = {
+  /*
+   * The principal used for all authenticated connections to listenerName is always clientPrincipal.
+   * The super user runs as kafkaPrincipal so we set the superuser admin client to connect directly to
+   * the interBrokerListenerName for superuser operations.
+   */ 
+  override def doSuperuserSetup(testInfo: TestInfo): Unit = {
+    superuserClientConfig.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers(interBrokerListenerName))
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = Array("kraft"))
+  def testListenerName(quorum: String): Unit = {
     // To check the client listener name, establish a session on the server by sending any request eg sendRecords
     val producer = createProducer()
     assertThrows(classOf[TopicAuthorizationException], () => sendRecords(producer, numRecords = 1, tp))

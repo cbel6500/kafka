@@ -22,7 +22,6 @@ import org.rocksdb.AbstractComparator;
 import org.rocksdb.AbstractEventListener;
 import org.rocksdb.AbstractSlice;
 import org.rocksdb.AbstractWalFilter;
-import org.rocksdb.AccessHint;
 import org.rocksdb.BuiltinComparator;
 import org.rocksdb.Cache;
 import org.rocksdb.ColumnFamilyOptions;
@@ -37,9 +36,11 @@ import org.rocksdb.DBOptions;
 import org.rocksdb.DbPath;
 import org.rocksdb.Env;
 import org.rocksdb.InfoLogLevel;
+import org.rocksdb.LoggerInterface;
 import org.rocksdb.MemTableConfig;
 import org.rocksdb.MergeOperator;
 import org.rocksdb.Options;
+import org.rocksdb.PrepopulateBlobCache;
 import org.rocksdb.RateLimiter;
 import org.rocksdb.SstFileManager;
 import org.rocksdb.SstPartitionerFactory;
@@ -320,12 +321,6 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
         return this;
     }
 
-    @Deprecated
-    @Override
-    public int maxBackgroundCompactions() {
-        return dbOptions.maxBackgroundCompactions();
-    }
-
     @Override
     public Options setStatistics(final Statistics statistics) {
         dbOptions.setStatistics(statistics);
@@ -337,24 +332,6 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
         return dbOptions.statistics();
     }
 
-    @Deprecated
-    @Override
-    public void setBaseBackgroundCompactions(final int baseBackgroundCompactions) {
-        dbOptions.setBaseBackgroundCompactions(baseBackgroundCompactions);
-    }
-
-    @Override
-    public int baseBackgroundCompactions() {
-        return dbOptions.baseBackgroundCompactions();
-    }
-
-    @Deprecated
-    @Override
-    public Options setMaxBackgroundCompactions(final int maxBackgroundCompactions) {
-        dbOptions.setMaxBackgroundCompactions(maxBackgroundCompactions);
-        return this;
-    }
-
     @Override
     public Options setMaxSubcompactions(final int maxSubcompactions) {
         dbOptions.setMaxSubcompactions(maxSubcompactions);
@@ -364,19 +341,6 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
     @Override
     public int maxSubcompactions() {
         return dbOptions.maxSubcompactions();
-    }
-
-    @Deprecated
-    @Override
-    public int maxBackgroundFlushes() {
-        return dbOptions.maxBackgroundFlushes();
-    }
-
-    @Deprecated
-    @Override
-    public Options setMaxBackgroundFlushes(final int maxBackgroundFlushes) {
-        dbOptions.setMaxBackgroundFlushes(maxBackgroundFlushes);
-        return this;
     }
 
     @Override
@@ -597,28 +561,6 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
     @Override
     public long dbWriteBufferSize() {
         return dbOptions.dbWriteBufferSize();
-    }
-
-    @Override
-    public Options setAccessHintOnCompactionStart(final AccessHint accessHint) {
-        dbOptions.setAccessHintOnCompactionStart(accessHint);
-        return this;
-    }
-
-    @Override
-    public AccessHint accessHintOnCompactionStart() {
-        return dbOptions.accessHintOnCompactionStart();
-    }
-
-    @Override
-    public Options setNewTableReaderForCompactionInputs(final boolean newTableReaderForCompactionInputs) {
-        dbOptions.setNewTableReaderForCompactionInputs(newTableReaderForCompactionInputs);
-        return this;
-    }
-
-    @Override
-    public boolean newTableReaderForCompactionInputs() {
-        return dbOptions.newTableReaderForCompactionInputs();
     }
 
     @Override
@@ -865,7 +807,7 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
     }
 
     @Override
-    public Options setLogger(final org.rocksdb.Logger logger) {
+    public Options setLogger(final LoggerInterface logger) {
         dbOptions.setLogger(logger);
         return this;
     }
@@ -936,6 +878,16 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
         return this;
     }
 
+    @Override
+    public Options setMemtableMaxRangeDeletions(final int n) {
+        columnFamilyOptions.setMemtableMaxRangeDeletions(n);
+        return this;
+    }
+
+    @Override
+    public int memtableMaxRangeDeletions() {
+        return columnFamilyOptions.memtableMaxRangeDeletions();
+    }
 
     @Override
     public Options setBottommostCompressionType(final CompressionType bottommostCompressionType) {
@@ -1487,17 +1439,6 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
     }
 
     @Override
-    public Options setPreserveDeletes(final boolean preserveDeletes) {
-        dbOptions.setPreserveDeletes(preserveDeletes);
-        return this;
-    }
-
-    @Override
-    public boolean preserveDeletes() {
-        return dbOptions.preserveDeletes();
-    }
-
-    @Override
     public Options setTwoWriteQueues(final boolean twoWriteQueues) {
         dbOptions.setTwoWriteQueues(twoWriteQueues);
         return this;
@@ -1685,6 +1626,39 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
         return this;
     }
 
+    @Override
+    public Options setBlobCompactionReadaheadSize(final long blobCompactionReadaheadSize) {
+        columnFamilyOptions.setBlobCompactionReadaheadSize(blobCompactionReadaheadSize);
+        return this;
+    }
+
+    @Override
+    public long blobCompactionReadaheadSize() {
+        return columnFamilyOptions.blobCompactionReadaheadSize();
+    }
+
+    @Override
+    public Options setMemtableWholeKeyFiltering(final boolean memtableWholeKeyFiltering) {
+        columnFamilyOptions.setMemtableWholeKeyFiltering(memtableWholeKeyFiltering);
+        return this;
+    }
+
+    @Override
+    public boolean memtableWholeKeyFiltering() {
+        return columnFamilyOptions.memtableWholeKeyFiltering();
+    }
+    
+    @Override
+    public Options setExperimentalMempurgeThreshold(final double experimentalMempurgeThreshold) {
+        columnFamilyOptions.setExperimentalMempurgeThreshold(experimentalMempurgeThreshold);
+        return this;
+    }
+
+    @Override
+    public double experimentalMempurgeThreshold() {
+        return columnFamilyOptions.experimentalMempurgeThreshold();
+    }
+
     //
     // BEGIN options for blobs (integrated BlobDB)
     //
@@ -1764,6 +1738,29 @@ public class RocksDBGenericOptionsToDbOptionsColumnFamilyOptionsAdapter extends 
     @Override
     public double blobGarbageCollectionForceThreshold() {
         return columnFamilyOptions.blobGarbageCollectionForceThreshold();
+    }
+
+
+    @Override
+    public Options setPrepopulateBlobCache(final PrepopulateBlobCache prepopulateBlobCache) {
+        columnFamilyOptions.setPrepopulateBlobCache(prepopulateBlobCache);
+        return this;
+    }
+
+    @Override
+    public PrepopulateBlobCache prepopulateBlobCache() {
+        return columnFamilyOptions.prepopulateBlobCache();
+    }
+
+    @Override
+    public Options setBlobFileStartingLevel(final int blobFileStartingLevel) {
+        columnFamilyOptions.setBlobFileStartingLevel(blobFileStartingLevel);
+        return this;
+    }
+
+    @Override
+    public int blobFileStartingLevel() {
+        return columnFamilyOptions.blobFileStartingLevel();
     }
 
     //

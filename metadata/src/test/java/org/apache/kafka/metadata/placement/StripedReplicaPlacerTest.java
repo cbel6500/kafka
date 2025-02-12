@@ -17,10 +17,13 @@
 
 package org.apache.kafka.metadata.placement;
 
+import org.apache.kafka.common.DirectoryId;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.InvalidReplicationFactorException;
-import org.apache.kafka.metadata.MockRandom;
 import org.apache.kafka.metadata.placement.StripedReplicaPlacer.BrokerList;
 import org.apache.kafka.metadata.placement.StripedReplicaPlacer.RackList;
+import org.apache.kafka.server.util.MockRandom;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -32,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.apache.kafka.metadata.placement.PartitionAssignmentTest.partitionAssignment;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -85,7 +89,7 @@ public class StripedReplicaPlacerTest {
         assertEquals(Arrays.asList(0, 4, 3, 2), rackList.place(4));
     }
 
-    private List<List<Integer>> place(
+    private TopicAssignment place(
         ReplicaPlacer placer,
         int startPartition,
         int numPartitions,
@@ -95,13 +99,17 @@ public class StripedReplicaPlacerTest {
         PlacementSpec placementSpec = new PlacementSpec(startPartition,
             numPartitions,
             replicationFactor);
-        ClusterDescriber cluster = new ClusterDescriber() {
+        return placer.place(placementSpec, new ClusterDescriber() {
             @Override
             public Iterator<UsableBroker> usableBrokers() {
                 return brokers.iterator();
             }
-        };
-        return placer.place(placementSpec, cluster);
+
+            @Override
+            public Uuid defaultDir(int brokerId) {
+                return DirectoryId.MIGRATING;
+            }
+        });
     }
 
     /**
@@ -112,9 +120,9 @@ public class StripedReplicaPlacerTest {
     public void testMultiPartitionTopicPlacementOnSingleUnfencedBroker() {
         MockRandom random = new MockRandom();
         StripedReplicaPlacer placer = new StripedReplicaPlacer(random);
-        assertEquals(Arrays.asList(Arrays.asList(0),
-                Arrays.asList(0),
-                Arrays.asList(0)),
+        assertEquals(new TopicAssignment(Arrays.asList(partitionAssignment(Collections.singletonList(0)),
+                partitionAssignment(Collections.singletonList(0)),
+                partitionAssignment(Collections.singletonList(0)))),
                 place(placer, 0, 3, (short) 1, Arrays.asList(
                         new UsableBroker(0, Optional.empty(), false),
                         new UsableBroker(1, Optional.empty(), true))));
@@ -218,11 +226,11 @@ public class StripedReplicaPlacerTest {
     public void testSuccessfulPlacement() {
         MockRandom random = new MockRandom();
         StripedReplicaPlacer placer = new StripedReplicaPlacer(random);
-        assertEquals(Arrays.asList(Arrays.asList(2, 3, 0),
-                Arrays.asList(3, 0, 1),
-                Arrays.asList(0, 1, 2),
-                Arrays.asList(1, 2, 3),
-                Arrays.asList(1, 0, 2)),
+        assertEquals(new TopicAssignment(Arrays.asList(partitionAssignment(Arrays.asList(2, 3, 0)),
+                partitionAssignment(Arrays.asList(3, 0, 1)),
+                partitionAssignment(Arrays.asList(0, 1, 2)),
+                partitionAssignment(Arrays.asList(1, 2, 3)),
+                partitionAssignment(Arrays.asList(1, 0, 2)))),
             place(placer, 0, 5, (short) 3, Arrays.asList(
                 new UsableBroker(0, Optional.empty(), false),
                 new UsableBroker(3, Optional.empty(), false),
@@ -234,14 +242,14 @@ public class StripedReplicaPlacerTest {
     public void testEvenDistribution() {
         MockRandom random = new MockRandom();
         StripedReplicaPlacer placer = new StripedReplicaPlacer(random);
-        List<List<Integer>> replicas = place(placer, 0, 200, (short) 2, Arrays.asList(
+        TopicAssignment topicAssignment = place(placer, 0, 200, (short) 2, Arrays.asList(
             new UsableBroker(0, Optional.empty(), false),
             new UsableBroker(1, Optional.empty(), false),
             new UsableBroker(2, Optional.empty(), false),
             new UsableBroker(3, Optional.empty(), false)));
         Map<List<Integer>, Integer> counts = new HashMap<>();
-        for (List<Integer> partitionReplicas : replicas) {
-            counts.put(partitionReplicas, counts.getOrDefault(partitionReplicas, 0) + 1);
+        for (PartitionAssignment partitionAssignment : topicAssignment.assignments()) {
+            counts.put(partitionAssignment.replicas(), counts.getOrDefault(partitionAssignment.replicas(), 0) + 1);
         }
         assertEquals(14, counts.get(Arrays.asList(0, 1)));
         assertEquals(22, counts.get(Arrays.asList(0, 2)));

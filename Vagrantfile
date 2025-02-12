@@ -54,11 +54,11 @@ ec2_iam_instance_profile_name = nil
 
 ebs_volume_type = 'gp3'
 
-jdk_major = '8'
-jdk_full = '8u202-linux-x64'
+jdk_major = '17'
+jdk_full = '17-linux-x64'
 
 local_config_file = File.join(File.dirname(__FILE__), "Vagrantfile.local")
-if File.exists?(local_config_file) then
+if File.exist?(local_config_file) then
   eval(File.read(local_config_file), binding, "Vagrantfile.local")
 end
 
@@ -161,7 +161,16 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     node.vm.provider :aws do |aws|
       aws.tags = {
         'Name' => ec2_instance_name_prefix + "-" + Socket.gethostname + "-" + name,
-        'JenkinsBuildUrl' => ENV['BUILD_URL']
+        'role' => 'ce-kafka',
+        'Owner' => 'ce-kafka',
+        'JenkinsBuildUrl' => ENV['BUILD_URL'],
+        'SemaphoreWorkflowUrl' => ENV['SEMAPHORE_WORKFLOW_URL'],
+        'SemaphoreJobId' => ENV['SEMAPHORE_JOB_ID'],
+        'cflt_environment' => 'devel',
+        'cflt_partition' => 'onprem',
+        'cflt_managed_by' => 'iac',
+        'cflt_managed_id' => 'kafka',
+        'cflt_service' => 'kafka'
       }
     end
   end

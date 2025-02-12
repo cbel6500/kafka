@@ -18,12 +18,13 @@ package org.apache.kafka.common.header.internals;
 
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
+
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.Iterator;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -128,7 +129,7 @@ public class RecordHeadersTest {
     }
 
     @Test
-    public void testReadOnly() throws IOException {
+    public void testReadOnly() {
         RecordHeaders headers = new RecordHeaders();
         headers.add(new RecordHeader("key", "value".getBytes()));
         Iterator<Header> headerIteratorBeforeClose = headers.iterator();
@@ -190,7 +191,7 @@ public class RecordHeadersTest {
     }
 
     @Test
-    public void testNew() throws IOException {
+    public void testNew() {
         RecordHeaders headers = new RecordHeaders();
         headers.add(new RecordHeader("key", "value".getBytes()));
         headers.setReadOnly();
@@ -219,18 +220,12 @@ public class RecordHeadersTest {
     }
 
     private int getCount(Headers headers) {
-        int count = 0;
-        Iterator<Header> headerIterator = headers.iterator();
-        while (headerIterator.hasNext()) {
-            headerIterator.next();
-            count++;
-        }
-        return count;
+        return headers.toArray().length;
     }
     
     static void assertHeader(String key, String value, Header actual) {
         assertEquals(key, actual.key());
-        assertTrue(Arrays.equals(value.getBytes(), actual.value()));
+        assertArrayEquals(value.getBytes(), actual.value());
     }
 
 }

@@ -37,6 +37,7 @@ import org.apache.kafka.streams.processor.api.Record;
 import org.apache.kafka.streams.processor.internals.InternalTopologyBuilder;
 import org.apache.kafka.streams.processor.internals.InternalTopologyBuilder.SubtopologyDescription;
 import org.apache.kafka.streams.processor.internals.ProcessorTopology;
+import org.apache.kafka.streams.processor.internals.StoreFactory;
 import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.SessionStore;
 import org.apache.kafka.streams.state.StoreBuilder;
@@ -44,42 +45,74 @@ import org.apache.kafka.streams.state.Stores;
 import org.apache.kafka.streams.state.WindowBytesStoreSupplier;
 import org.apache.kafka.streams.state.WindowStore;
 import org.apache.kafka.streams.state.internals.KeyValueStoreBuilder;
+import org.apache.kafka.streams.utils.TestUtils.RecordingProcessorWrapper;
+import org.apache.kafka.streams.utils.TestUtils.RecordingProcessorWrapper.WrapperRecorder;
 import org.apache.kafka.test.MockApiProcessorSupplier;
 import org.apache.kafka.test.MockKeyValueStore;
 import org.apache.kafka.test.MockProcessorSupplier;
 import org.apache.kafka.test.MockValueJoiner;
 import org.apache.kafka.test.StreamsTestUtils;
-import org.easymock.EasyMock;
-import org.junit.Assert;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.Timeout;
+
+import org.hamcrest.Matchers;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.internal.util.collections.Sets;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
 
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Random;
 import java.util.Set;
 import java.util.regex.Pattern;
 
 import static java.time.Duration.ofMillis;
+import static org.apache.kafka.streams.StreamsConfig.PROCESSOR_WRAPPER_CLASS_CONFIG;
+import static org.apache.kafka.streams.utils.TestUtils.PROCESSOR_WRAPPER_COUNTER_CONFIG;
+import static org.apache.kafka.streams.utils.TestUtils.dummyStreamsConfigMap;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
-@SuppressWarnings("deprecation")
+@Timeout(600)
+@ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.STRICT_STUBS)
 public class TopologyTest {
-    @Rule
-    public Timeout globalTimeout = Timeout.seconds(600);
 
-    private final StoreBuilder<MockKeyValueStore> storeBuilder = EasyMock.createNiceMock(StoreBuilder.class);
-    private final KeyValueStoreBuilder<?, ?> globalStoreBuilder = EasyMock.createNiceMock(KeyValueStoreBuilder.class);
+    @Mock
+    private StoreBuilder<MockKeyValueStore> storeBuilder;
+    @Mock
+    private KeyValueStoreBuilder<?, ?> globalStoreBuilder;
     private final Topology topology = new Topology();
     private final InternalTopologyBuilder.TopologyDescription expectedDescription = new InternalTopologyBuilder.TopologyDescription();
+    private StreamsConfig streamsConfig;
+
+    @BeforeEach
+    public void setUp() {
+        final HashMap<String, Object> configs = new HashMap<>();
+        configs.put(StreamsConfig.APPLICATION_ID_CONFIG, "applicationId");
+
+        // not used, but required for StreamsConfig
+        configs.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        configs.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+        configs.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+
+        streamsConfig = new StreamsConfig(configs);
+    }
 
     @Test
     public void shouldNotAllowNullNameWhenAddingSourceWithTopic() {
@@ -113,8 +146,7 @@ public class TopologyTest {
 
     @Test
     public void shouldNotAllowNullProcessorSupplierWhenAddingProcessor() {
-        assertThrows(NullPointerException.class, () -> topology.addProcessor("name",
-            (ProcessorSupplier<Object, Object, Object, Object>) null));
+        assertThrows(NullPointerException.class, () -> topology.addProcessor("name", null));
     }
 
     @Test
@@ -279,14 +311,12 @@ public class TopologyTest {
     @Test
     public void shouldNotAllowToAddStateStoreToNonExistingProcessor() {
         mockStoreBuilder();
-        EasyMock.replay(storeBuilder);
         assertThrows(TopologyException.class, () -> topology.addStateStore(storeBuilder, "no-such-processor"));
     }
 
     @Test
     public void shouldNotAllowToAddStateStoreToSource() {
         mockStoreBuilder();
-        EasyMock.replay(storeBuilder);
         topology.addSource("source-1", "topic-1");
         try {
             topology.addStateStore(storeBuilder, "source-1");
@@ -297,7 +327,6 @@ public class TopologyTest {
     @Test
     public void shouldNotAllowToAddStateStoreToSink() {
         mockStoreBuilder();
-        EasyMock.replay(storeBuilder);
         topology.addSource("source-1", "topic-1");
         topology.addSink("sink-1", "topic-1", "source-1");
         try {
@@ -307,22 +336,16 @@ public class TopologyTest {
     }
 
     private void mockStoreBuilder() {
-        EasyMock.expect(storeBuilder.name()).andReturn("store").anyTimes();
-        EasyMock.expect(storeBuilder.logConfig()).andReturn(Collections.emptyMap());
-        EasyMock.expect(storeBuilder.loggingEnabled()).andReturn(false);
+        when(storeBuilder.name()).thenReturn("store");
     }
 
     @Test
     public void shouldNotAllowToAddStoreWithSameNameAndDifferentInstance() {
         mockStoreBuilder();
-        EasyMock.replay(storeBuilder);
         topology.addStateStore(storeBuilder);
 
-        final StoreBuilder otherStoreBuilder = EasyMock.createNiceMock(StoreBuilder.class);
-        EasyMock.expect(otherStoreBuilder.name()).andReturn("store").anyTimes();
-        EasyMock.expect(otherStoreBuilder.logConfig()).andReturn(Collections.emptyMap());
-        EasyMock.expect(otherStoreBuilder.loggingEnabled()).andReturn(false);
-        EasyMock.replay(otherStoreBuilder);
+        final StoreBuilder<?> otherStoreBuilder = mock(StoreBuilder.class);
+        when(otherStoreBuilder.name()).thenReturn("store");
         try {
             topology.addStateStore(otherStoreBuilder);
             fail("Should have thrown TopologyException for same store name with different StoreBuilder");
@@ -332,7 +355,6 @@ public class TopologyTest {
     @Test
     public void shouldAllowToShareStoreUsingSameStoreBuilder() {
         mockStoreBuilder();
-        EasyMock.replay(storeBuilder);
 
         topology.addSource("source", "topic-1");
 
@@ -353,6 +375,7 @@ public class TopologyTest {
         }
     }
 
+    @SuppressWarnings("resource")
     @Test
     public void shouldThrowOnUnassignedStateStoreAccess() {
         final String sourceNodeName = "source";
@@ -360,8 +383,7 @@ public class TopologyTest {
         final String badNodeName = "badGuy";
 
         mockStoreBuilder();
-        EasyMock.expect(storeBuilder.build()).andReturn(new MockKeyValueStore("store", false));
-        EasyMock.replay(storeBuilder);
+        when(storeBuilder.build()).thenReturn(new MockKeyValueStore("store", false));
         topology
             .addSource(sourceNodeName, "topic")
             .addProcessor(goodNodeName, new LocalMockProcessorSupplier(), sourceNodeName)
@@ -385,11 +407,11 @@ public class TopologyTest {
     }
 
     private static class LocalMockProcessorSupplier implements ProcessorSupplier<Object, Object, Object, Object> {
-        final static String STORE_NAME = "store";
+        static final String STORE_NAME = "store";
 
         @Override
         public Processor<Object, Object, Object, Object> get() {
-            return new Processor<Object, Object, Object, Object>() {
+            return new Processor<>() {
                 @Override
                 public void init(final ProcessorContext<Object, Object> context) {
                     context.getStateStore(STORE_NAME);
@@ -401,11 +423,8 @@ public class TopologyTest {
         }
     }
 
-    @Deprecated // testing old PAPI
     @Test
     public void shouldNotAllowToAddGlobalStoreWithSourceNameEqualsProcessorName() {
-        EasyMock.expect(globalStoreBuilder.name()).andReturn("anyName").anyTimes();
-        EasyMock.replay(globalStoreBuilder);
         assertThrows(TopologyException.class, () -> topology.addGlobalStore(
             globalStoreBuilder,
             "sameName",
@@ -712,6 +731,7 @@ public class TopologyTest {
         assertThat(topology.describe().hashCode(), equalTo(expectedDescription.hashCode()));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void streamStreamJoinTopologyWithDefaultStoresNames() {
         final StreamsBuilder builder  = new StreamsBuilder();
@@ -754,6 +774,7 @@ public class TopologyTest {
             describe.toString());
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void streamStreamJoinTopologyWithCustomStoresNames() {
         final StreamsBuilder builder  = new StreamsBuilder();
@@ -797,6 +818,7 @@ public class TopologyTest {
             describe.toString());
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void streamStreamJoinTopologyWithCustomStoresSuppliers() {
         final StreamsBuilder builder  = new StreamsBuilder();
@@ -1133,7 +1155,7 @@ public class TopologyTest {
     public void topologyWithDynamicRoutingShouldDescribeExtractorClass() {
         final StreamsBuilder builder  = new StreamsBuilder();
 
-        final TopicNameExtractor<Object, Object> topicNameExtractor = new TopicNameExtractor<Object, Object>() {
+        final TopicNameExtractor<Object, Object> topicNameExtractor = new TopicNameExtractor<>() {
             @Override
             public String extract(final Object key, final Object value, final RecordContext recordContext) {
                 return recordContext.topic() + "-" + key;
@@ -1177,6 +1199,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1200,6 +1223,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1224,6 +1248,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1246,9 +1271,11 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void kGroupedStreamZeroArgCountWithTopologyConfigShouldPreserveTopologyStructure() {
         // override the default store into in-memory
@@ -1270,6 +1297,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1278,7 +1306,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(TimeWindows.of(ofMillis(1)))
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(ofMillis(1)))
             .count();
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1293,6 +1321,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1301,7 +1330,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(TimeWindows.of(ofMillis(1)))
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(ofMillis(1)))
             .count(Materialized.<Object, Long, WindowStore<Bytes, byte[]>>as("count-store").withStoreType(Materialized.StoreType.IN_MEMORY));
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1316,6 +1345,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1324,7 +1354,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(TimeWindows.of(ofMillis(1)))
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(ofMillis(1)))
             .count(Materialized.<Object, Long, WindowStore<Bytes, byte[]>>with(null, Serdes.Long())
                 .withStoreType(Materialized.StoreType.ROCKS_DB));
         final Topology topology = builder.build();
@@ -1340,6 +1370,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1348,7 +1379,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(TimeWindows.of(ofMillis(1)))
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(ofMillis(1)))
             .count(Materialized.as(Materialized.StoreType.IN_MEMORY));
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1363,16 +1394,18 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void timeWindowZeroArgCountWithTopologyConfigShouldPreserveTopologyStructure() {
         // override the default store into in-memory
         final StreamsBuilder builder = new StreamsBuilder(overrideDefaultStore(StreamsConfig.IN_MEMORY));
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(TimeWindows.of(ofMillis(1)))
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(ofMillis(1)))
             .count();
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1387,6 +1420,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1395,7 +1429,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(TimeWindows.of(ofMillis(1)))
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(ofMillis(1)))
             .count();
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1410,6 +1444,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1418,7 +1453,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(TimeWindows.of(ofMillis(1)))
+            .windowedBy(TimeWindows.ofSizeWithNoGrace(ofMillis(1)))
             .count(Materialized.<Object, Long, WindowStore<Bytes, byte[]>>as("count-store").withStoreType(Materialized.StoreType.IN_MEMORY));
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1433,9 +1468,11 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void slidingWindowZeroArgCountWithTopologyConfigShouldPreserveTopologyStructure() {
         // override the default store into in-memory
@@ -1457,6 +1494,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1485,6 +1523,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1514,9 +1553,11 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void timeWindowedCogroupedZeroArgCountWithTopologyConfigShouldPreserveTopologyStructure() {
         // override the default store into in-memory
@@ -1543,6 +1584,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1571,6 +1613,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1600,9 +1643,11 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void slidingWindowedCogroupedZeroArgCountWithTopologyConfigShouldPreserveTopologyStructure() {
         // override the default store into in-memory
@@ -1628,6 +1673,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1656,6 +1702,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1685,9 +1732,11 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void sessionWindowedCogroupedZeroArgCountWithTopologyConfigShouldPreserveTopologyStructure() {
         // override the default store into in-memory
@@ -1713,6 +1762,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1721,7 +1771,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(SessionWindows.with(ofMillis(1)))
+            .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(ofMillis(1)))
             .count();
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1736,6 +1786,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1744,7 +1795,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(SessionWindows.with(ofMillis(1)))
+            .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(ofMillis(1)))
             .count(Materialized.<Object, Long, SessionStore<Bytes, byte[]>>as("count-store")
                 .withStoreType(Materialized.StoreType.IN_MEMORY));
         final Topology topology = builder.build();
@@ -1760,6 +1811,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1768,7 +1820,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(SessionWindows.with(ofMillis(1)))
+            .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(ofMillis(1)))
             .count(Materialized.<Object, Long, SessionStore<Bytes, byte[]>>with(null, Serdes.Long())
                 .withStoreType(Materialized.StoreType.ROCKS_DB));
         final Topology topology = builder.build();
@@ -1784,6 +1836,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(true));
     }
 
@@ -1792,7 +1845,7 @@ public class TopologyTest {
         final StreamsBuilder builder = new StreamsBuilder();
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(SessionWindows.with(ofMillis(1)))
+            .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(ofMillis(1)))
             .count(Materialized.as(Materialized.StoreType.IN_MEMORY));
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1807,16 +1860,18 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void sessionWindowZeroArgCountWithTopologyConfigShouldPreserveTopologyStructure() {
         // override the default store into in-memory
         final StreamsBuilder builder = new StreamsBuilder(overrideDefaultStore(StreamsConfig.IN_MEMORY));
         builder.stream("input-topic")
             .groupByKey()
-            .windowedBy(SessionWindows.with(ofMillis(1)))
+            .windowedBy(SessionWindows.ofInactivityGapWithNoGrace(ofMillis(1)))
             .count();
         final Topology topology = builder.build();
         final TopologyDescription describe = topology.describe();
@@ -1831,6 +1886,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         assertThat(topology.internalTopologyBuilder.setApplicationId("test").buildTopology().hasPersistentLocalStore(), is(false));
     }
 
@@ -1866,6 +1922,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         final ProcessorTopology processorTopology = topology.internalTopologyBuilder.setApplicationId("test").buildTopology();
         // one for ktable, and one for count operation
         assertThat(processorTopology.stateStores().size(), is(2));
@@ -1908,6 +1965,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         final ProcessorTopology processorTopology = topology.internalTopologyBuilder.setApplicationId("test").buildTopology();
         // one for ktable, and one for count operation
         assertThat(processorTopology.stateStores().size(), is(2));
@@ -1917,6 +1975,7 @@ public class TopologyTest {
         assertThat(processorTopology.stateStores().get(1).persistent(), is(false));
     }
 
+    @SuppressWarnings("deprecation")
     @Test
     public void tableNamedMaterializedCountWithTopologyConfigShouldPreserveTopologyStructure() {
         // override the default store into in-memory
@@ -1951,6 +2010,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         final ProcessorTopology processorTopology = topology.internalTopologyBuilder.setApplicationId("test").buildTopology();
         // one for ktable, and one for count operation
         assertThat(processorTopology.stateStores().size(), is(2));
@@ -1993,6 +2053,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         final ProcessorTopology processorTopology = topology.internalTopologyBuilder.setApplicationId("test").buildTopology();
         // one for ktable, and one for count operation
         assertThat(processorTopology.stateStores().size(), is(2));
@@ -2034,6 +2095,7 @@ public class TopologyTest {
             describe.toString()
         );
 
+        topology.internalTopologyBuilder.setStreamsConfig(streamsConfig);
         final ProcessorTopology processorTopology = topology.internalTopologyBuilder.setApplicationId("test").buildTopology();
         // one for ktable, and one for count operation
         assertThat(processorTopology.stateStores().size(), is(2));
@@ -2049,18 +2111,16 @@ public class TopologyTest {
         final KTable<Object, Object> table = builder.table("input-topic");
         table.mapValues((readOnlyKey, value) -> null);
         final TopologyDescription describe = builder.build().describe();
-        Assert.assertEquals(
-            "Topologies:\n" +
-                "   Sub-topology: 0\n" +
-                "    Source: KSTREAM-SOURCE-0000000001 (topics: [input-topic])\n" +
-                "      --> KTABLE-SOURCE-0000000002\n" +
-                "    Processor: KTABLE-SOURCE-0000000002 (stores: [])\n" +
-                "      --> KTABLE-MAPVALUES-0000000003\n" +
-                "      <-- KSTREAM-SOURCE-0000000001\n" +
-                "    Processor: KTABLE-MAPVALUES-0000000003 (stores: [])\n" +
-                "      --> none\n" +
-                "      <-- KTABLE-SOURCE-0000000002\n\n",
-            describe.toString());
+        assertEquals("Topologies:\n" +
+            "   Sub-topology: 0\n" +
+            "    Source: KSTREAM-SOURCE-0000000001 (topics: [input-topic])\n" +
+            "      --> KTABLE-SOURCE-0000000002\n" +
+            "    Processor: KTABLE-SOURCE-0000000002 (stores: [])\n" +
+            "      --> KTABLE-MAPVALUES-0000000003\n" +
+            "      <-- KSTREAM-SOURCE-0000000001\n" +
+            "    Processor: KTABLE-MAPVALUES-0000000003 (stores: [])\n" +
+            "      --> none\n" +
+            "      <-- KTABLE-SOURCE-0000000002\n\n", describe.toString());
     }
 
     @Test
@@ -2072,7 +2132,7 @@ public class TopologyTest {
             Materialized.<Object, Object, KeyValueStore<Bytes, byte[]>>with(null, null)
                 .withStoreType(Materialized.StoreType.IN_MEMORY));
         final TopologyDescription describe = builder.build().describe();
-        Assert.assertEquals(
+        assertEquals(
             "Topologies:\n" +
                 "   Sub-topology: 0\n" +
                 "    Source: KSTREAM-SOURCE-0000000001 (topics: [input-topic])\n" +
@@ -2098,7 +2158,7 @@ public class TopologyTest {
             (readOnlyKey, value) -> null,
             Materialized.<Object, Object, KeyValueStore<Bytes, byte[]>>as("store-name").withKeySerde(null).withValueSerde(null));
         final TopologyDescription describe = builder.build().describe();
-        Assert.assertEquals(
+        assertEquals(
             "Topologies:\n" +
                 "   Sub-topology: 0\n" +
                 "    Source: KSTREAM-SOURCE-0000000001 (topics: [input-topic])\n" +
@@ -2119,7 +2179,7 @@ public class TopologyTest {
         final KTable<Object, Object> table = builder.table("input-topic");
         table.filter((key, value) -> false);
         final TopologyDescription describe = builder.build().describe();
-        Assert.assertEquals(
+        assertEquals(
             "Topologies:\n" +
                 "   Sub-topology: 0\n" +
                 "    Source: KSTREAM-SOURCE-0000000001 (topics: [input-topic])\n" +
@@ -2139,7 +2199,7 @@ public class TopologyTest {
         final KTable<Object, Object> table = builder.table("input-topic");
         table.filter((key, value) -> false, Materialized.with(null, null));
         final TopologyDescription describe = builder.build().describe();
-        Assert.assertEquals(
+        assertEquals(
             "Topologies:\n" +
                 "   Sub-topology: 0\n" +
                 "    Source: KSTREAM-SOURCE-0000000001 (topics: [input-topic])\n" +
@@ -2164,7 +2224,7 @@ public class TopologyTest {
         table.filter((key, value) -> false, Materialized.as("store-name"));
         final TopologyDescription describe = builder.build().describe();
 
-        Assert.assertEquals(
+        assertEquals(
             "Topologies:\n" +
                 "   Sub-topology: 0\n" +
                 "    Source: KSTREAM-SOURCE-0000000001 (topics: [input-topic])\n" +
@@ -2195,17 +2255,17 @@ public class TopologyTest {
 
     private TopologyDescription.Source addSource(final String sourceName,
                                                  final String... sourceTopic) {
-        topology.addSource(null, sourceName, null, null, null, sourceTopic);
-        final StringBuilder allSourceTopics = new StringBuilder(sourceTopic[0]);
-        for (int i = 1; i < sourceTopic.length; ++i) {
-            allSourceTopics.append(", ").append(sourceTopic[i]);
-        }
+        topology.addSource((AutoOffsetReset) null, sourceName, null, null, null, sourceTopic);
         return new InternalTopologyBuilder.Source(sourceName, new HashSet<>(Arrays.asList(sourceTopic)), null);
     }
 
+    @SuppressWarnings("deprecation")
     private TopologyDescription.Source addSource(final String sourceName,
                                                  final Pattern sourcePattern) {
-        topology.addSource(null, sourceName, null, null, null, sourcePattern);
+        // we still test the old `Topology.AutoOffsetReset` here, to increase test coverage
+        // (cf `addSource` about which used the new one)
+        // When can rewrite this to the new one, when the old one is removed
+        topology.addSource((Topology.AutoOffsetReset) null, sourceName, null, null, null, sourcePattern);
         return new InternalTopologyBuilder.Source(sourceName, null, sourcePattern);
     }
 
@@ -2238,9 +2298,8 @@ public class TopologyTest {
         topology.addProcessor(processorName, new MockApiProcessorSupplier<>(), parentNames);
         if (newStores) {
             for (final String store : storeNames) {
-                final StoreBuilder<?> storeBuilder = EasyMock.createNiceMock(StoreBuilder.class);
-                EasyMock.expect(storeBuilder.name()).andReturn(store).anyTimes();
-                EasyMock.replay(storeBuilder);
+                final StoreBuilder<?> storeBuilder = mock(StoreBuilder.class);
+                when(storeBuilder.name()).thenReturn(store);
                 topology.addStateStore(storeBuilder, processorName);
             }
         } else {
@@ -2267,7 +2326,7 @@ public class TopologyTest {
 
         topology.addSink(sinkName, sinkTopic, null, null, null, parentNames);
         final TopologyDescription.Sink expectedSinkNode =
-            new InternalTopologyBuilder.Sink(sinkName, sinkTopic);
+            new InternalTopologyBuilder.Sink<>(sinkName, sinkTopic);
 
         for (final TopologyDescription.Node parent : parents) {
             ((InternalTopologyBuilder.AbstractNode) parent).addSuccessor(expectedSinkNode);
@@ -2277,15 +2336,13 @@ public class TopologyTest {
         return expectedSinkNode;
     }
 
-    @Deprecated // testing old PAPI
     private void addGlobalStoreToTopologyAndExpectedDescription(final String globalStoreName,
                                                                 final String sourceName,
                                                                 final String globalTopicName,
                                                                 final String processorName,
                                                                 final int id) {
-        final KeyValueStoreBuilder<?, ?> globalStoreBuilder = EasyMock.createNiceMock(KeyValueStoreBuilder.class);
-        EasyMock.expect(globalStoreBuilder.name()).andReturn(globalStoreName).anyTimes();
-        EasyMock.replay(globalStoreBuilder);
+        final KeyValueStoreBuilder<?, ?> globalStoreBuilder = mock(KeyValueStoreBuilder.class);
+        when(globalStoreBuilder.name()).thenReturn(globalStoreName);
         topology.addGlobalStore(
             globalStoreBuilder,
             sourceName,
@@ -2306,6 +2363,99 @@ public class TopologyTest {
         expectedDescription.addGlobalStore(expectedGlobalStore);
     }
 
+    @Test
+    public void readOnlyStateStoresShouldHaveTheirOwnSubTopology() {
+        final String sourceName = "source";
+        final String storeName = "store";
+        final String topicName = "topic";
+        final String processorName = "processor";
+
+        final KeyValueStoreBuilder<?, ?> storeBuilder = mock(KeyValueStoreBuilder.class);
+        when(storeBuilder.name()).thenReturn(storeName);
+        topology.addReadOnlyStateStore(
+                storeBuilder,
+                sourceName,
+                null,
+                null,
+                null,
+                topicName,
+                processorName,
+                new MockProcessorSupplier<>());
+
+        final TopologyDescription.Source expectedSource = new InternalTopologyBuilder.Source(sourceName, Sets.newSet(topicName), null);
+        final TopologyDescription.Processor expectedProcessor = new InternalTopologyBuilder.Processor(processorName, Sets.newSet(storeName));
+
+        ((InternalTopologyBuilder.AbstractNode) expectedSource).addSuccessor(expectedProcessor);
+        ((InternalTopologyBuilder.AbstractNode) expectedProcessor).addPredecessor(expectedSource);
+
+        final Set<TopologyDescription.Node> allNodes = new HashSet<>();
+        allNodes.add(expectedSource);
+        allNodes.add(expectedProcessor);
+        expectedDescription.addSubtopology(new SubtopologyDescription(0, allNodes));
+
+        assertThat(topology.describe(), equalTo(expectedDescription));
+        assertThat(topology.describe().hashCode(), equalTo(expectedDescription.hashCode()));
+    }
+
+    @Test
+    public void readOnlyStateStoresShouldNotLog() {
+        final String sourceName = "source";
+        final String storeName = "store";
+        final String topicName = "topic";
+        final String processorName = "processor";
+
+        final KeyValueStoreBuilder<?, ?> storeBuilder = mock(KeyValueStoreBuilder.class);
+        when(storeBuilder.name()).thenReturn(storeName);
+        topology.addReadOnlyStateStore(
+                storeBuilder,
+                sourceName,
+                null,
+                null,
+                null,
+                topicName,
+                processorName,
+                new MockProcessorSupplier<>());
+
+        final StoreFactory stateStoreFactory = topology.internalTopologyBuilder.stateStores().get(storeName);
+        assertThat(stateStoreFactory.loggingEnabled(), equalTo(false));
+    }
+
+    @Test
+    public void shouldWrapProcessors() {
+        final Map<Object, Object> props = dummyStreamsConfigMap();
+        props.put(PROCESSOR_WRAPPER_CLASS_CONFIG, RecordingProcessorWrapper.class);
+
+        final WrapperRecorder counter = new WrapperRecorder();
+        props.put(PROCESSOR_WRAPPER_COUNTER_CONFIG, counter);
+
+        final Topology topology = new Topology(new TopologyConfig(new StreamsConfig(props)));
+
+        // Add a bit of randomness to the lambda-created processors to avoid them being
+        // optimized into a shared instance that will cause the ApiUtils#checkSupplier
+        // call to fail
+        final Random random = new Random();
+
+        topology.addSource("source", "topic");
+        topology.addProcessor(
+            "p1",
+            () -> record -> System.out.println("Processing: " + random.nextInt()),
+            "source"
+        );
+        topology.addProcessor(
+            "p2",
+            () -> record -> System.out.println("Processing: " + random.nextInt()),
+            "p1"
+        );
+        topology.addProcessor(
+            "p3",
+            () -> record -> System.out.println("Processing: " + random.nextInt()),
+            "p2"
+        );
+        assertThat(counter.numWrappedProcessors(), is(3));
+        assertThat(counter.wrappedProcessorNames(), Matchers.containsInAnyOrder("p1", "p2", "p3"));
+    }
+
+    @SuppressWarnings("deprecation")
     private TopologyConfig overrideDefaultStore(final String defaultStore) {
         final Properties topologyOverrides = new Properties();
         // change default store as in-memory

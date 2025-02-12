@@ -19,9 +19,9 @@ package org.apache.kafka.controller;
 
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.metadata.Replicas;
+import org.apache.kafka.server.common.TopicIdPartition;
 import org.apache.kafka.timeline.SnapshotRegistry;
 import org.apache.kafka.timeline.TimelineHashMap;
-import org.apache.kafka.timeline.TimelineInteger;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -50,9 +50,9 @@ import static org.apache.kafka.metadata.Replicas.NONE;
  * works because partition IDs cannot be negative.
  */
 public class BrokersToIsrs {
-    private final static int LEADER_FLAG = 0x8000_0000;
+    private static final int LEADER_FLAG = 0x8000_0000;
 
-    private final static int REPLICA_MASK = 0x7fff_ffff;
+    private static final int REPLICA_MASK = 0x7fff_ffff;
 
     static class PartitionsOnReplicaIterator implements Iterator<TopicIdPartition> {
         private final Iterator<Entry<Uuid, int[]>> iterator;
@@ -105,12 +105,9 @@ public class BrokersToIsrs {
      */
     private final TimelineHashMap<Integer, TimelineHashMap<Uuid, int[]>> isrMembers;
     
-    private final TimelineInteger offlinePartitionCount;
-
     BrokersToIsrs(SnapshotRegistry snapshotRegistry) {
         this.snapshotRegistry = snapshotRegistry;
         this.isrMembers = new TimelineHashMap<>(snapshotRegistry, 0);
-        this.offlinePartitionCount = new TimelineInteger(snapshotRegistry);
     }
 
     /**
@@ -131,9 +128,6 @@ public class BrokersToIsrs {
         } else {
             if (prevLeader == NO_LEADER) {
                 prev = Replicas.copyWith(prevIsr, NO_LEADER);
-                if (nextLeader != NO_LEADER) {
-                    offlinePartitionCount.decrement();
-                }
             } else {
                 prev = Replicas.clone(prevIsr);
             }
@@ -145,9 +139,6 @@ public class BrokersToIsrs {
         } else {
             if (nextLeader == NO_LEADER) {
                 next = Replicas.copyWith(nextIsr, NO_LEADER);
-                if (prevLeader != NO_LEADER) {
-                    offlinePartitionCount.increment();
-                }
             } else {
                 next = Replicas.clone(nextIsr);
             }
@@ -191,9 +182,6 @@ public class BrokersToIsrs {
     void removeTopicEntryForBroker(Uuid topicId, int brokerId) {
         Map<Uuid, int[]> topicMap = isrMembers.get(brokerId);
         if (topicMap != null) {
-            if (brokerId == NO_LEADER) {
-                offlinePartitionCount.set(offlinePartitionCount.get() - topicMap.get(topicId).length);
-            }
             topicMap.remove(topicId);
         }
     }
@@ -269,11 +257,10 @@ public class BrokersToIsrs {
             }
         } else {
             int[] newPartitions = new int[partitions.length - 1];
-            int j = 0;
-            for (int i = 0; i < partitions.length; i++) {
-                int partition = partitions[i];
+            int i = 0;
+            for (int partition : partitions) {
                 if (partition != removedPartition) {
-                    newPartitions[j++] = partition;
+                    newPartitions[i++] = partition;
                 }
             }
             topicMap.put(topicId, newPartitions);
@@ -302,9 +289,5 @@ public class BrokersToIsrs {
 
     boolean hasLeaderships(int brokerId) {
         return iterator(brokerId, true).hasNext();
-    }
-
-    int offlinePartitionCount() {
-        return offlinePartitionCount.get();
     }
 }

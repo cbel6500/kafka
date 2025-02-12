@@ -16,15 +16,13 @@
  */
 package kafka.coordinator.transaction
 
-import java.io.PrintStream
 import java.nio.ByteBuffer
-import java.nio.charset.StandardCharsets
-
-import kafka.internals.generated.{TransactionLogKey, TransactionLogValue}
-import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.protocol.{ByteBufferAccessor, MessageUtil}
-import org.apache.kafka.common.record.{CompressionType, Record, RecordBatch}
-import org.apache.kafka.common.{MessageFormatter, TopicPartition}
+import org.apache.kafka.common.record.RecordBatch
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.coordinator.transaction.generated.{CoordinatorRecordType, TransactionLogKey, TransactionLogValue}
+import org.apache.kafka.server.common.TransactionVersion
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
@@ -39,19 +37,12 @@ import scala.jdk.CollectionConverters._
  */
 object TransactionLog {
 
-  // log-level config default values and enforced values
-  val DefaultNumPartitions: Int = 50
-  val DefaultSegmentBytes: Int = 100 * 1024 * 1024
-  val DefaultReplicationFactor: Short = 3.toShort
-  val DefaultMinInSyncReplicas: Int = 2
-  val DefaultLoadBufferSize: Int = 5 * 1024 * 1024
-
   // enforce always using
   //  1. cleanup policy = compact
   //  2. compression = none
   //  3. unclean leader election = disabled
   //  4. required acks = -1 when writing
-  val EnforcedCompressionType: CompressionType = CompressionType.NONE
+  val EnforcedCompression: Compression = Compression.NONE
   val EnforcedRequiredAcks: Short = (-1).toShort
 
   /**
@@ -60,8 +51,7 @@ object TransactionLog {
     * @return key bytes
     */
   private[transaction] def keyToBytes(transactionalId: String): Array[Byte] = {
-    MessageUtil.toVersionPrefixedBytes(TransactionLogKey.HIGHEST_SUPPORTED_VERSION,
-      new TransactionLogKey().setTransactionalId(transactionalId))
+    MessageUtil.toCoordinatorTypePrefixedBytes(new TransactionLogKey().setTransactionalId(transactionalId))
   }
 
   /**
@@ -69,7 +59,8 @@ object TransactionLog {
     *
     * @return value payload bytes
     */
-  private[transaction] def valueToBytes(txnMetadata: TxnTransitMetadata): Array[Byte] = {
+  private[transaction] def valueToBytes(txnMetadata: TxnTransitMetadata,
+                                        transactionVersionLevel: TransactionVersion): Array[Byte] = {
     if (txnMetadata.txnState == Empty && txnMetadata.topicPartitions.nonEmpty)
         throw new IllegalStateException(s"Transaction is not expected to have any partitions since its state is ${txnMetadata.txnState}: $txnMetadata")
 
@@ -82,7 +73,9 @@ object TransactionLog {
             .setPartitionIds(partitions.map(tp => Integer.valueOf(tp.partition)).toList.asJava)
         }.toList.asJava
 
-    MessageUtil.toVersionPrefixedBytes(TransactionLogValue.HIGHEST_SUPPORTED_VERSION,
+    // Serialize with version 0 (highest non-flexible version) until transaction.version 1 is enabled
+    // which enables flexible fields in records.
+    MessageUtil.toVersionPrefixedBytes(transactionVersionLevel.transactionLogValueVersion(),
       new TransactionLogValue()
         .setProducerId(txnMetadata.producerId)
         .setProducerEpoch(txnMetadata.producerEpoch)
@@ -90,7 +83,8 @@ object TransactionLog {
         .setTransactionStatus(txnMetadata.txnState.id)
         .setTransactionLastUpdateTimestampMs(txnMetadata.txnLastUpdateTimestamp)
         .setTransactionStartTimestampMs(txnMetadata.txnStartTimestamp)
-        .setTransactionPartitions(transactionPartitions))
+        .setTransactionPartitions(transactionPartitions)
+        .setClientTransactionVersion(txnMetadata.clientTransactionVersion.featureLevel()))
   }
 
   /**
@@ -98,15 +92,17 @@ object TransactionLog {
     *
     * @return the key
     */
-  def readTxnRecordKey(buffer: ByteBuffer): TxnKey = {
+  def readTxnRecordKey(buffer: ByteBuffer): BaseKey = {
     val version = buffer.getShort
-    if (version >= TransactionLogKey.LOWEST_SUPPORTED_VERSION && version <= TransactionLogKey.HIGHEST_SUPPORTED_VERSION) {
-      val value = new TransactionLogKey(new ByteBufferAccessor(buffer), version)
+    if (version == CoordinatorRecordType.TRANSACTION_LOG.id) {
+      val value = new TransactionLogKey(new ByteBufferAccessor(buffer), 0.toShort)
       TxnKey(
         version = version,
         transactionalId = value.transactionalId
       )
-    } else throw new IllegalStateException(s"Unknown version $version from the transaction log message")
+    } else {
+      UnknownKey(version)
+    }
   }
 
   /**
@@ -124,14 +120,16 @@ object TransactionLog {
         val transactionMetadata = new TransactionMetadata(
           transactionalId = transactionalId,
           producerId = value.producerId,
-          lastProducerId = RecordBatch.NO_PRODUCER_ID,
+          prevProducerId = value.previousProducerId,
+          nextProducerId = value.nextProducerId,
           producerEpoch = value.producerEpoch,
           lastProducerEpoch = RecordBatch.NO_PRODUCER_EPOCH,
           txnTimeoutMs = value.transactionTimeoutMs,
           state = TransactionState.fromId(value.transactionStatus),
           topicPartitions = mutable.Set.empty[TopicPartition],
           txnStartTimestamp = value.transactionStartTimestampMs,
-          txnLastUpdateTimestamp = value.transactionLastUpdateTimestampMs)
+          txnLastUpdateTimestamp = value.transactionLastUpdateTimestampMs,
+          clientTransactionVersion = TransactionVersion.fromFeatureLevel(value.clientTransactionVersion))
 
         if (!transactionMetadata.state.equals(Empty))
           value.transactionPartitions.forEach(partitionsSchema =>
@@ -144,48 +142,19 @@ object TransactionLog {
       } else throw new IllegalStateException(s"Unknown version $version from the transaction log message value")
     }
   }
-
-  // Formatter for use with tools to read transaction log messages
-  class TransactionLogMessageFormatter extends MessageFormatter {
-    def writeTo(consumerRecord: ConsumerRecord[Array[Byte], Array[Byte]], output: PrintStream): Unit = {
-      Option(consumerRecord.key).map(key => readTxnRecordKey(ByteBuffer.wrap(key))).foreach { txnKey =>
-        val transactionalId = txnKey.transactionalId
-        val value = consumerRecord.value
-        val producerIdMetadata = if (value == null)
-          None
-        else
-          readTxnRecordValue(transactionalId, ByteBuffer.wrap(value))
-        output.write(transactionalId.getBytes(StandardCharsets.UTF_8))
-        output.write("::".getBytes(StandardCharsets.UTF_8))
-        output.write(producerIdMetadata.getOrElse("NULL").toString.getBytes(StandardCharsets.UTF_8))
-        output.write("\n".getBytes(StandardCharsets.UTF_8))
-      }
-    }
-  }
-
-  /**
-   * Exposed for printing records using [[kafka.tools.DumpLogSegments]]
-   */
-  def formatRecordKeyAndValue(record: Record): (Option[String], Option[String]) = {
-    val txnKey = TransactionLog.readTxnRecordKey(record.key)
-    val keyString = s"transaction_metadata::transactionalId=${txnKey.transactionalId}"
-
-    val valueString = TransactionLog.readTxnRecordValue(txnKey.transactionalId, record.value) match {
-      case None => "<DELETE>"
-
-      case Some(txnMetadata) => s"producerId:${txnMetadata.producerId}," +
-        s"producerEpoch:${txnMetadata.producerEpoch}," +
-        s"state=${txnMetadata.state}," +
-        s"partitions=${txnMetadata.topicPartitions.mkString("[", ",", "]")}," +
-        s"txnLastUpdateTimestamp=${txnMetadata.txnLastUpdateTimestamp}," +
-        s"txnTimeoutMs=${txnMetadata.txnTimeoutMs}"
-    }
-
-    (Some(keyString), Some(valueString))
-  }
-
 }
 
-case class TxnKey(version: Short, transactionalId: String) {
+sealed trait BaseKey{
+  def version: Short
+  def transactionalId: String
+}
+
+case class TxnKey(version: Short, transactionalId: String) extends BaseKey {
   override def toString: String = transactionalId
 }
+
+case class UnknownKey(version: Short) extends BaseKey {
+  override def transactionalId: String = null
+  override def toString: String = transactionalId
+}
+

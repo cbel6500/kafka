@@ -16,11 +16,12 @@
  */
 package org.apache.kafka.common.message;
 
+import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.MessageUtil;
-import org.apache.kafka.common.record.CompressionType;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.SimpleRecord;
+
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -31,8 +32,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 public class RecordsSerdeTest {
 
     @Test
-    public void testSerdeRecords() throws Exception {
-        MemoryRecords records = MemoryRecords.withRecords(CompressionType.NONE,
+    public void testSerdeRecords() {
+        MemoryRecords records = MemoryRecords.withRecords(Compression.NONE,
             new SimpleRecord("foo".getBytes()),
             new SimpleRecord("bar".getBytes()));
 
@@ -44,7 +45,7 @@ public class RecordsSerdeTest {
     }
 
     @Test
-    public void testSerdeNullRecords() throws Exception {
+    public void testSerdeNullRecords() {
         SimpleRecordsMessageData message = new SimpleRecordsMessageData()
             .setTopic("foo");
         assertNull(message.recordSet());
@@ -53,14 +54,14 @@ public class RecordsSerdeTest {
     }
 
     @Test
-    public void testSerdeEmptyRecords() throws Exception {
+    public void testSerdeEmptyRecords() {
         SimpleRecordsMessageData message = new SimpleRecordsMessageData()
             .setTopic("foo")
             .setRecordSet(MemoryRecords.EMPTY);
         testAllRoundTrips(message);
     }
 
-    private void testAllRoundTrips(SimpleRecordsMessageData message) throws Exception {
+    private void testAllRoundTrips(SimpleRecordsMessageData message) {
         for (short version = SimpleRecordsMessageData.LOWEST_SUPPORTED_VERSION;
              version <= SimpleRecordsMessageData.HIGHEST_SUPPORTED_VERSION;
              version++) {

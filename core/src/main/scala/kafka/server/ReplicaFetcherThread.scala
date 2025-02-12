@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,11 +17,13 @@
 
 package kafka.server
 
-import kafka.log.{LeaderOffsetIncremented, LogAppendInfo}
-import org.apache.kafka.common.record.MemoryRecords
-import org.apache.kafka.common.requests._
 import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.common.record.MemoryRecords
+import org.apache.kafka.common.requests.FetchResponse
+import org.apache.kafka.server.common.{MetadataVersion, OffsetAndEpoch}
+import org.apache.kafka.storage.internals.log.{LogAppendInfo, LogStartOffsetIncrementReason}
+
+import scala.collection.mutable
 
 class ReplicaFetcherThread(name: String,
                            leader: LeaderEndPoint,
@@ -35,13 +37,15 @@ class ReplicaFetcherThread(name: String,
                                 clientId = name,
                                 leader = leader,
                                 failedPartitions,
+                                fetchTierStateMachine = new TierStateMachine(leader, replicaMgr, false),
                                 fetchBackOffMs = brokerConfig.replicaFetchBackoffMs,
                                 isInterruptible = false,
                                 replicaMgr.brokerTopicStats) {
 
   this.logIdent = logPrefix
 
-  override protected val isOffsetForLeaderEpochSupported: Boolean = metadataVersionSupplier().isOffsetForLeaderEpochSupported
+  // Visible for testing
+  private[server] val partitionsWithNewHighWatermark = mutable.Buffer[TopicPartition]()
 
   override protected def latestEpoch(topicPartition: TopicPartition): Option[Int] = {
     replicaMgr.localLogOrException(topicPartition).latestEpoch
@@ -88,6 +92,11 @@ class ReplicaFetcherThread(name: String,
     }
   }
 
+  override def doWork(): Unit = {
+    super.doWork()
+    completeDelayedFetchRequests()
+  }
+
   // process fetched data
   override def processPartitionData(topicPartition: TopicPartition,
                                     fetchOffset: Long,
@@ -104,7 +113,7 @@ class ReplicaFetcherThread(name: String,
         topicPartition, fetchOffset, log.logEndOffset))
 
     if (logTrace)
-      trace("Follower has replica log end offset %d for partition %s. Received %d messages and leader hw %d"
+      trace("Follower has replica log end offset %d for partition %s. Received %d bytes of messages and leader hw %d"
         .format(log.logEndOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
 
     // Append the leader's messages to the log
@@ -117,10 +126,16 @@ class ReplicaFetcherThread(name: String,
 
     // For the follower replica, we do not need to keep its segment base offset and physical position.
     // These values will be computed upon becoming leader or handling a preferred read replica fetch.
-    val followerHighWatermark = log.updateHighWatermark(partitionData.highWatermark)
-    log.maybeIncrementLogStartOffset(leaderLogStartOffset, LeaderOffsetIncremented)
+    var maybeUpdateHighWatermarkMessage = s"but did not update replica high watermark"
+    log.maybeUpdateHighWatermark(partitionData.highWatermark).foreach { newHighWatermark =>
+      maybeUpdateHighWatermarkMessage = s"and updated replica high watermark to $newHighWatermark"
+      partitionsWithNewHighWatermark += topicPartition
+    }
+
+    log.maybeIncrementLogStartOffset(leaderLogStartOffset, LogStartOffsetIncrementReason.LeaderOffsetIncremented)
     if (logTrace)
-      trace(s"Follower set replica high watermark for partition $topicPartition to $followerHighWatermark")
+      trace(s"Follower received high watermark ${partitionData.highWatermark} from the leader " +
+        s"$maybeUpdateHighWatermarkMessage for partition $topicPartition")
 
     // Traffic from both in-sync and out of sync replicas are accounted for in replication quota to ensure total replication
     // traffic doesn't exceed quota.
@@ -135,7 +150,14 @@ class ReplicaFetcherThread(name: String,
     logAppendInfo
   }
 
-  def maybeWarnIfOversizedRecords(records: MemoryRecords, topicPartition: TopicPartition): Unit = {
+  private def completeDelayedFetchRequests(): Unit = {
+    if (partitionsWithNewHighWatermark.nonEmpty) {
+      replicaMgr.completeDelayedFetchRequests(partitionsWithNewHighWatermark.toSeq)
+      partitionsWithNewHighWatermark.clear()
+    }
+  }
+
+  private def maybeWarnIfOversizedRecords(records: MemoryRecords, topicPartition: TopicPartition): Unit = {
     // oversized messages don't cause replication to fail from fetch request version 3 (KIP-74)
     if (metadataVersionSupplier().fetchRequestVersion <= 2 && records.sizeInBytes > 0 && records.validBytes <= 0)
       error(s"Replication is failing due to a message that is greater than replica.fetch.max.bytes for partition $topicPartition. " +
@@ -168,5 +190,4 @@ class ReplicaFetcherThread(name: String,
     val partition = replicaMgr.getPartitionOrException(topicPartition)
     partition.truncateFullyAndStartAt(offset, isFuture = false)
   }
-
 }

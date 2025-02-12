@@ -24,6 +24,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.internals.Plugin;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.CumulativeSum;
@@ -36,6 +37,9 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.header.Headers;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
+import org.apache.kafka.connect.runtime.errors.ErrorReporter;
+import org.apache.kafka.connect.runtime.errors.ProcessingContext;
 import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
 import org.apache.kafka.connect.runtime.errors.Stage;
 import org.apache.kafka.connect.runtime.errors.ToleranceType;
@@ -43,6 +47,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTask;
 import org.apache.kafka.connect.source.SourceTaskContext;
 import org.apache.kafka.connect.storage.CloseableOffsetStorageReader;
+import org.apache.kafka.connect.storage.ClusterConfigState;
 import org.apache.kafka.connect.storage.ConnectorOffsetBackingStore;
 import org.apache.kafka.connect.storage.Converter;
 import org.apache.kafka.connect.storage.HeaderConverter;
@@ -53,6 +58,7 @@ import org.apache.kafka.connect.util.ConnectorTaskId;
 import org.apache.kafka.connect.util.TopicAdmin;
 import org.apache.kafka.connect.util.TopicCreation;
 import org.apache.kafka.connect.util.TopicCreationGroup;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,13 +70,15 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import static org.apache.kafka.connect.runtime.WorkerConfig.TOPIC_TRACKING_ENABLE_CONFIG;
 
 /**
- * WorkerTask that contains shared logic for running source tasks with either standard or exactly-once delivery guarantees.
+ * WorkerTask that contains shared logic for running source tasks with either standard semantics
+ * (i.e., either at-least-once or at-most-once) or exactly-once semantics.
  */
-public abstract class AbstractWorkerSourceTask extends WorkerTask {
+public abstract class AbstractWorkerSourceTask extends WorkerTask<SourceRecord, SourceRecord> {
     private static final Logger log = LoggerFactory.getLogger(AbstractWorkerSourceTask.class);
 
     private static final long SEND_FAILED_BACKOFF_MS = 100;
@@ -153,6 +161,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
 
     /**
      * Invoked when a record given to {@link Producer#send(ProducerRecord, Callback)} has failed with a non-retriable error.
+     * @param context the context for this record
      * @param synchronous whether the error occurred during the invocation of {@link Producer#send(ProducerRecord, Callback)}.
      *                    If {@code false}, indicates that the error was reported asynchronously by the producer by a {@link Callback}
      * @param producerRecord the {@link ProducerRecord} that the producer failed to send; never null
@@ -161,6 +170,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
      *          via {@link Callback} after the call to {@link Producer#send(ProducerRecord, Callback)} completed
      */
     protected abstract void producerSendFailed(
+            ProcessingContext<SourceRecord> context,
             boolean synchronous,
             ProducerRecord<byte[], byte[]> producerRecord,
             SourceRecord preTransformRecord,
@@ -176,16 +186,14 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
 
 
     protected final WorkerConfig workerConfig;
-    protected final WorkerSourceTaskContext sourceTaskContext;
     protected final ConnectorOffsetBackingStore offsetStore;
     protected final OffsetStorageWriter offsetWriter;
     protected final Producer<byte[], byte[]> producer;
 
     private final SourceTask task;
-    private final Converter keyConverter;
-    private final Converter valueConverter;
-    private final HeaderConverter headerConverter;
-    private final TransformationChain<SourceRecord> transformationChain;
+    private final Plugin<Converter> keyConverterPlugin;
+    private final Plugin<Converter> valueConverterPlugin;
+    private final Plugin<HeaderConverter> headerConverterPlugin;
     private final TopicAdmin admin;
     private final CloseableOffsetStorageReader offsetReader;
     private final SourceTaskMetricsGroup sourceTaskMetricsGroup;
@@ -197,6 +205,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
     // Visible for testing
     List<SourceRecord> toSend;
     protected Map<String, String> taskConfig;
+    protected WorkerSourceTaskContext sourceTaskContext;
     protected boolean started = false;
     private volatile boolean producerClosed = false;
 
@@ -204,11 +213,12 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                                        SourceTask task,
                                        TaskStatus.Listener statusListener,
                                        TargetState initialState,
-                                       Converter keyConverter,
-                                       Converter valueConverter,
-                                       HeaderConverter headerConverter,
-                                       TransformationChain<SourceRecord> transformationChain,
-                                       WorkerSourceTaskContext sourceTaskContext,
+                                       ClusterConfigState configState,
+                                       Plugin<Converter> keyConverterPlugin,
+                                       Plugin<Converter> valueConverterPlugin,
+                                       Plugin<HeaderConverter> headerConverterPlugin,
+                                       TransformationChain<SourceRecord, SourceRecord> transformationChain,
+                                       WorkerTransactionContext workerTransactionContext,
                                        Producer<byte[], byte[]> producer,
                                        TopicAdmin admin,
                                        Map<String, TopicCreationGroup> topicGroups,
@@ -217,29 +227,30 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                                        ConnectorOffsetBackingStore offsetStore,
                                        WorkerConfig workerConfig,
                                        ConnectMetrics connectMetrics,
+                                       ErrorHandlingMetrics errorMetrics,
                                        ClassLoader loader,
                                        Time time,
-                                       RetryWithToleranceOperator retryWithToleranceOperator,
+                                       RetryWithToleranceOperator<SourceRecord> retryWithToleranceOperator,
                                        StatusBackingStore statusBackingStore,
-                                       Executor closeExecutor) {
+                                       Executor closeExecutor,
+                                       Supplier<List<ErrorReporter<SourceRecord>>> errorReportersSupplier) {
 
-        super(id, statusListener, initialState, loader, connectMetrics,
-                retryWithToleranceOperator, time, statusBackingStore);
+        super(id, statusListener, initialState, loader, connectMetrics, errorMetrics,
+                retryWithToleranceOperator, transformationChain, errorReportersSupplier,
+                time, statusBackingStore);
 
         this.workerConfig = workerConfig;
         this.task = task;
-        this.keyConverter = keyConverter;
-        this.valueConverter = valueConverter;
-        this.headerConverter = headerConverter;
-        this.transformationChain = transformationChain;
+        this.keyConverterPlugin = keyConverterPlugin;
+        this.valueConverterPlugin = valueConverterPlugin;
+        this.headerConverterPlugin = headerConverterPlugin;
         this.producer = producer;
         this.admin = admin;
         this.offsetReader = offsetReader;
         this.offsetWriter = offsetWriter;
         this.offsetStore = Objects.requireNonNull(offsetStore, "offset store cannot be null for source tasks");
         this.closeExecutor = closeExecutor;
-        this.sourceTaskContext = sourceTaskContext;
-
+        this.sourceTaskContext = new WorkerSourceTaskContext(offsetReader, id, configState, workerTransactionContext, pluginMetrics);
         this.stopRequestedLatch = new CountDownLatch(1);
         this.sourceTaskMetricsGroup = new SourceTaskMetricsGroup(id, connectMetrics);
         this.topicTrackingEnabled = workerConfig.getBoolean(TOPIC_TRACKING_ENABLE_CONFIG);
@@ -310,11 +321,12 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         if (admin != null) {
             Utils.closeQuietly(() -> admin.close(Duration.ofSeconds(30)), "source task admin");
         }
-        Utils.closeQuietly(transformationChain, "transformation chain");
-        Utils.closeQuietly(retryWithToleranceOperator, "retry operator");
         Utils.closeQuietly(offsetReader, "offset reader");
         Utils.closeQuietly(offsetStore::stop, "offset backing store");
-        Utils.closeQuietly(headerConverter, "header converter");
+        Utils.closeQuietly(headerConverterPlugin, "header converter");
+        Utils.closeQuietly(keyConverterPlugin, "key converter");
+        Utils.closeQuietly(valueConverterPlugin, "value converter");
+        Utils.closeQuietly(pluginMetrics, "pluginMetrics");
     }
 
     private void closeProducer(Duration duration) {
@@ -350,18 +362,22 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                         recordPollReturned(toSend.size(), time.milliseconds() - start);
                     }
                 }
-                if (toSend == null)
-                    continue;
-                log.trace("{} About to send {} records to Kafka", this, toSend.size());
-                if (sendRecords()) {
+                if (toSend == null) {
                     batchDispatched();
-                } else {
+                    continue;
+                }
+                log.trace("{} About to send {} records to Kafka", this, toSend.size());
+                if (!sendRecords()) {
                     stopRequestedLatch.await(SEND_FAILED_BACKOFF_MS, TimeUnit.MILLISECONDS);
                 }
             }
         } catch (InterruptedException e) {
             // Ignore and allow to exit.
         } catch (RuntimeException e) {
+            if (isCancelled()) {
+                log.debug("Skipping final offset commit as task has been cancelled");
+                throw e;
+            }
             try {
                 finalOffsetCommit(true);
             } catch (Exception offsetException) {
@@ -382,14 +398,15 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         int processed = 0;
         recordBatch(toSend.size());
         final SourceRecordWriteCounter counter =
-                toSend.size() > 0 ? new SourceRecordWriteCounter(toSend.size(), sourceTaskMetricsGroup) : null;
+                toSend.isEmpty() ? null : new SourceRecordWriteCounter(toSend.size(), sourceTaskMetricsGroup);
         for (final SourceRecord preTransformRecord : toSend) {
-            retryWithToleranceOperator.sourceRecord(preTransformRecord);
-            final SourceRecord record = transformationChain.apply(preTransformRecord);
-            final ProducerRecord<byte[], byte[]> producerRecord = convertTransformedRecord(record);
-            if (producerRecord == null || retryWithToleranceOperator.failed()) {
+            ProcessingContext<SourceRecord> context = new ProcessingContext<>(preTransformRecord);
+            final SourceRecord record = transformationChain.apply(context, preTransformRecord);
+            final ProducerRecord<byte[], byte[]> producerRecord = convertTransformedRecord(context, record);
+            if (producerRecord == null || context.failed()) {
                 counter.skipRecord();
                 recordDropped(preTransformRecord);
+                processed++;
                 continue;
             }
 
@@ -408,7 +425,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                                 log.error("{} failed to send record to {}: ", AbstractWorkerSourceTask.this, topic, e);
                             }
                             log.trace("{} Failed record: {}", AbstractWorkerSourceTask.this, preTransformRecord);
-                            producerSendFailed(false, producerRecord, preTransformRecord, e);
+                            producerSendFailed(context, false, producerRecord, preTransformRecord, e);
                             if (retryWithToleranceOperator.getErrorToleranceType() == ToleranceType.ALL) {
                                 counter.skipRecord();
                                 submittedRecord.ifPresent(SubmittedRecords.SubmittedRecord::ack);
@@ -440,12 +457,13 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                 log.trace("{} Failed to send {} with unrecoverable exception: ", this, producerRecord, e);
                 throw e;
             } catch (KafkaException e) {
-                producerSendFailed(true, producerRecord, preTransformRecord, e);
+                producerSendFailed(context, true, producerRecord, preTransformRecord, e);
             }
             processed++;
             recordDispatched(preTransformRecord);
         }
         toSend = null;
+        batchDispatched();
         return true;
     }
 
@@ -466,20 +484,20 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
      * @return the producer record which can sent over to Kafka. A null is returned if the input is null or
      * if an error was encountered during any of the converter stages.
      */
-    protected ProducerRecord<byte[], byte[]> convertTransformedRecord(SourceRecord record) {
+    protected ProducerRecord<byte[], byte[]> convertTransformedRecord(ProcessingContext<SourceRecord> context, SourceRecord record) {
         if (record == null) {
             return null;
         }
 
-        RecordHeaders headers = retryWithToleranceOperator.execute(() -> convertHeaderFor(record), Stage.HEADER_CONVERTER, headerConverter.getClass());
+        RecordHeaders headers = retryWithToleranceOperator.execute(context, () -> convertHeaderFor(record), Stage.HEADER_CONVERTER, headerConverterPlugin.get().getClass());
 
-        byte[] key = retryWithToleranceOperator.execute(() -> keyConverter.fromConnectData(record.topic(), headers, record.keySchema(), record.key()),
-                Stage.KEY_CONVERTER, keyConverter.getClass());
+        byte[] key = retryWithToleranceOperator.execute(context, () -> keyConverterPlugin.get().fromConnectData(record.topic(), headers, record.keySchema(), record.key()),
+                Stage.KEY_CONVERTER, keyConverterPlugin.get().getClass());
 
-        byte[] value = retryWithToleranceOperator.execute(() -> valueConverter.fromConnectData(record.topic(), headers, record.valueSchema(), record.value()),
-                Stage.VALUE_CONVERTER, valueConverter.getClass());
+        byte[] value = retryWithToleranceOperator.execute(context, () -> valueConverterPlugin.get().fromConnectData(record.topic(), headers, record.valueSchema(), record.value()),
+                Stage.VALUE_CONVERTER, valueConverterPlugin.get().getClass());
 
-        if (retryWithToleranceOperator.failed()) {
+        if (context.failed()) {
             return null;
         }
 
@@ -533,7 +551,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
             String topic = record.topic();
             for (Header header : headers) {
                 String key = header.key();
-                byte[] rawHeader = headerConverter.fromConnectHeader(topic, key, header.schema(), header.value());
+                byte[] rawHeader = headerConverterPlugin.get().fromConnectHeader(topic, key, header.schema(), header.value());
                 result.add(key, rawHeader);
             }
         }
@@ -569,6 +587,8 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         private final int batchSize;
         private boolean completed = false;
         private int counter;
+        private int skipped; // Keeps track of filtered records
+
         public SourceRecordWriteCounter(int batchSize, SourceTaskMetricsGroup metricsGroup) {
             assert batchSize > 0;
             assert metricsGroup != null;
@@ -577,6 +597,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
             this.metricsGroup = metricsGroup;
         }
         public void skipRecord() {
+            skipped += 1;
             if (counter > 0 && --counter == 0) {
                 finishedAllWrites();
             }
@@ -591,7 +612,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         }
         private void finishedAllWrites() {
             if (!completed) {
-                metricsGroup.recordWrite(batchSize - counter);
+                metricsGroup.recordWrite(batchSize - counter, skipped);
                 completed = true;
             }
         }
@@ -643,8 +664,8 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
             sourceRecordActiveCount.record(activeRecordCount);
         }
 
-        void recordWrite(int recordCount) {
-            sourceRecordWrite.record(recordCount);
+        void recordWrite(int recordCount, int skippedCount) {
+            sourceRecordWrite.record(recordCount - skippedCount);
             activeRecordCount -= recordCount;
             activeRecordCount = Math.max(0, activeRecordCount);
             sourceRecordActiveCount.record(activeRecordCount);

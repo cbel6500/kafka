@@ -30,7 +30,7 @@ import java.util.Objects;
 
 public class ConnectSchema implements Schema {
     /**
-     * Maps Schema.Types to a list of Java classes that can be used to represent them.
+     * Maps {@link Schema.Type}s to a list of Java classes that can be used to represent them.
      */
     private static final Map<Type, List<Class<?>>> SCHEMA_TYPE_CLASSES = new EnumMap<>(Type.class);
     /**
@@ -39,7 +39,7 @@ public class ConnectSchema implements Schema {
     private static final Map<String, List<Class<?>>> LOGICAL_TYPE_CLASSES = new HashMap<>();
 
     /**
-     * Maps the Java classes to the corresponding Schema.Type.
+     * Maps the Java classes to the corresponding {@link Schema.Type}.
      */
     private static final Map<Class<?>, Type> JAVA_CLASS_SCHEMA_TYPES = new HashMap<>();
 
@@ -205,7 +205,7 @@ public class ConnectSchema implements Schema {
 
     /**
      * Validate that the value can be used with the schema, i.e. that its type matches the schema type and nullability
-     * requirements. Throws a DataException if the value is invalid.
+     * requirements. Throws a {@link DataException} if the value is invalid.
      * @param schema Schema to test
      * @param value value to test
      */
@@ -213,11 +213,15 @@ public class ConnectSchema implements Schema {
         validateValue(null, schema, value);
     }
 
-    public static void validateValue(String name, Schema schema, Object value) {
+    public static void validateValue(String field, Schema schema, Object value) {
+        validateValue(schema, value, field == null ? "value" : "field: \"" + field + "\"");
+    }
+
+    private static void validateValue(Schema schema, Object value, String location) {
         if (value == null) {
             if (!schema.isOptional())
-                throw new DataException("Invalid value: null used for required field: \"" + name
-                        + "\", schema type: " + schema.type());
+                throw new DataException("Invalid value: null used for required " + location
+                        + ", schema type: " + schema.type());
             return;
         }
 
@@ -236,8 +240,8 @@ public class ConnectSchema implements Schema {
                 exceptionMessage.append(" \"").append(schema.name()).append("\"");
             }
             exceptionMessage.append(" with type ").append(schema.type()).append(": ").append(value.getClass());
-            if (name != null) {
-                exceptionMessage.append(" for field: \"").append(name).append("\"");
+            if (location != null) {
+                exceptionMessage.append(" for ").append(location);
             }
             throw new DataException(exceptionMessage.toString());
         }
@@ -251,17 +255,31 @@ public class ConnectSchema implements Schema {
                 break;
             case ARRAY:
                 List<?> array = (List<?>) value;
-                for (Object entry : array)
-                    validateValue(schema.valueSchema(), entry);
+                String entryLocation = "element of array " + location;
+                Schema arrayValueSchema = assertSchemaNotNull(schema.valueSchema(), entryLocation);
+                for (Object entry : array) {
+                    validateValue(arrayValueSchema, entry, entryLocation);
+                }
                 break;
             case MAP:
                 Map<?, ?> map = (Map<?, ?>) value;
+                String keyLocation = "key of map " + location;
+                String valueLocation = "value of map " + location;
+                Schema mapKeySchema = assertSchemaNotNull(schema.keySchema(), keyLocation);
+                Schema mapValueSchema = assertSchemaNotNull(schema.valueSchema(), valueLocation);
                 for (Map.Entry<?, ?> entry : map.entrySet()) {
-                    validateValue(schema.keySchema(), entry.getKey());
-                    validateValue(schema.valueSchema(), entry.getValue());
+                    validateValue(mapKeySchema, entry.getKey(), keyLocation);
+                    validateValue(mapValueSchema, entry.getValue(), valueLocation);
                 }
                 break;
         }
+    }
+
+    private static Schema assertSchemaNotNull(Schema schema, String location) {
+        if (schema == null) {
+            throw new DataException("No schema defined for " + location);
+        }
+        return schema;
     }
 
     private static List<Class<?>> expectedClassesFor(Schema schema) {
@@ -273,7 +291,7 @@ public class ConnectSchema implements Schema {
 
     /**
      * Validate that the value can be used for this schema, i.e. that its type matches the schema type and optional
-     * requirements. Throws a DataException if the value is invalid.
+     * requirements. Throws a {@link DataException} if the value is invalid.
      * @param value the value to validate
      */
     public void validateValue(Object value) {
@@ -324,7 +342,7 @@ public class ConnectSchema implements Schema {
     /**
      * Get the {@link Schema.Type} associated with the given class.
      *
-     * @param klass the Class to
+     * @param klass the Class whose associated schema type is to be returned
      * @return the corresponding type, or null if there is no matching type
      */
     public static Type schemaType(Class<?> klass) {

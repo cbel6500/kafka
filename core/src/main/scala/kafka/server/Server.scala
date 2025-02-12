@@ -16,11 +16,12 @@
  */
 package kafka.server
 
-import java.util.concurrent.TimeUnit
-
 import org.apache.kafka.clients.CommonClientConfigs
-import org.apache.kafka.common.metrics.{JmxReporter, KafkaMetricsContext, MetricConfig, Metrics, MetricsReporter, Sensor}
+import org.apache.kafka.common.metrics.{KafkaMetricsContext, MetricConfig, Metrics, MetricsReporter, Sensor}
 import org.apache.kafka.common.utils.Time
+
+import java.util
+import java.util.concurrent.TimeUnit
 
 
 trait Server {
@@ -32,7 +33,6 @@ trait Server {
 object Server {
   val MetricsPrefix: String = "kafka.server"
   val ClusterIdLabel: String = "kafka.cluster.id"
-  val BrokerIdLabel: String = "kafka.broker.id"
   val NodeIdLabel: String = "kafka.node.id"
 
   def initializeMetrics(
@@ -49,9 +49,8 @@ object Server {
     time: Time,
     metricsContext: KafkaMetricsContext
   ): Metrics = {
-    val defaultReporters = initializeDefaultReporters(config)
     val metricConfig = buildMetricsConfig(config)
-    new Metrics(metricConfig, defaultReporters, time, true, metricsContext)
+    new Metrics(metricConfig, new util.ArrayList[MetricsReporter](), time, true, metricsContext)
   }
 
   def buildMetricsConfig(
@@ -69,26 +68,9 @@ object Server {
   ): KafkaMetricsContext = {
     val contextLabels = new java.util.HashMap[String, Object]
     contextLabels.put(ClusterIdLabel, clusterId)
-
-    if (config.usesSelfManagedQuorum) {
-      contextLabels.put(NodeIdLabel, config.nodeId.toString)
-    } else {
-      contextLabels.put(BrokerIdLabel, config.brokerId.toString)
-    }
-
+    contextLabels.put(NodeIdLabel, config.nodeId.toString)
     contextLabels.putAll(config.originalsWithPrefix(CommonClientConfigs.METRICS_CONTEXT_PREFIX))
     new KafkaMetricsContext(MetricsPrefix, contextLabels)
-  }
-
-  private def initializeDefaultReporters(
-    config: KafkaConfig
-  ): java.util.List[MetricsReporter] = {
-    val jmxReporter = new JmxReporter()
-    jmxReporter.configure(config.originals)
-
-    val reporters = new java.util.ArrayList[MetricsReporter]
-    reporters.add(jmxReporter)
-    reporters
   }
 
   sealed trait ProcessStatus
